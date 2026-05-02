@@ -1,0 +1,9 @@
+LIBRARY version
+
+EXPORTS
+    GetFileVersionInfoSizeA = VerStub_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeW = VerStub_GetFileVersionInfoSizeW
+    GetFileVersionInfoA     = VerStub_GetFileVersionInfoA
+    GetFileVersionInfoW     = VerStub_GetFileVersionInfoW
+    VerQueryValueA          = VerStub_VerQueryValueA
+    VerQueryValueW          = VerStub_VerQueryValueW

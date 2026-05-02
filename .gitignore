@@ -1,0 +1,14 @@
+# Build intermediates
+Release/obj/
+Release/*.lib
+Release/*.exp
+
+# Log files
+*.log
+
+# Internal architecture notes (not for distribution)
+INTERNALS.md
+
+# Visual Studio
+.vs/
+*.user
