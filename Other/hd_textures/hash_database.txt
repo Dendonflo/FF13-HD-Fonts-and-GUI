@@ -162,6 +162,16 @@ d944ce06ae447329 shop13/shop_parts01
 cd9243eba7ed8389 shop13/shop_parts06
 ecfd8a5cae0b7c2c shop13/shop_parts07
 
+# TITLE SCREEN (namespaced with maps to avoid memory hogging)
+0e0db85ffc767b39 gui_scene00000/logo_bw
+c3dc6cbddce4b7a2 gui_scene00000/title_alpha
+44c7f46ae28d5e6b gui_scene00000/logo_color
+0845e63ffa67848c gui_scene00000/title_color
+d64c67ff81e002d4 gui_scene00000/parts
+2642149868dc0baf gui_scene00000/parts_us
+cb593934b4705335 gui_scene00000/sqex_logo
+c6433c8c43830f20 gui_scene00000/thm_que
+
 # SCENE SPECIFIC GUI (HOPE'S ROBOT, CHOCOBO ON PULSE, GADOT'S ARTWORK, ...)
 35fedb44b0035f45 gui_scene00004/bg_floor
 0a9b2706535913b2 gui_scene00004/face_vileboss
@@ -1352,4 +1362,5 @@ c4665967eb9b1f53 summary26/summary_bg_26
 892ea51e76d9ca81 summary29/summary_bg_29
 892ea51e76d9ca81 summary30/summary_bg_30
 892ea51e76d9ca81 summary31/summary_bg_31
+
 

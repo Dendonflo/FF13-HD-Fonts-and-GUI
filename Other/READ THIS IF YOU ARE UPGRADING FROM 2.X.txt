@@ -1,0 +1,43 @@
+================================================================================
+         STOP. READ THIS BEFORE INSTALLING IF YOU HAVE AN OLDER 2.X VERSION.
+================================================================================
+
+THE PREVIOUS 2.X VERSIONS OF THIS MOD SHIPPED AS d3d9.dll.
+THIS VERSION SHIPS AS version.dll.
+
+IF YOU INSTALL THIS WITHOUT REMOVING THE OLD VERSION FIRST, YOU WILL HAVE
+TWO CONFLICTING MOD FILES IN YOUR GAME FOLDER AND THE GAME WILL CRASH.
+
+================================================================================
+WHAT YOU NEED TO DO BEFORE INSTALLING
+================================================================================
+
+  1. GO TO YOUR GAME FOLDER:
+       <game_install_folder>/white_data/prog/win/bin/
+
+  2. DELETE THE OLD d3d9.dll and FF13Fix.ini FROM THAT FOLDER.
+
+  3. IF YOU WANT TO KEEP FF13Fix :
+       REINSTALL FF13Fix (the original, unmodified version):
+         https://github.com/rebtd7/FF13Fix
+       OR FF13Fix PLUS (check the README for the blurry UI bug fix)
+         https://www.nexusmods.com/finalfantasy13/mods/63
+
+  4. ONLY THEN PROCEED WITH INSTALLING THIS MOD AS DESCRIBED IN README.txt.
+
+================================================================================
+WHY THIS IS NECESSARY
+================================================================================
+
+  The old version of this mod was built on top of FF13Fix and shipped as a
+  replacement for it. The new version is a standalone module that works
+  alongside FF13Fix instead of replacing it. They use different files and
+  cannot coexist.
+
+================================================================================
+IF YOU ARE UPGRADING FROM 3.X, OR THIS IS A FRESH INSTALL
+================================================================================
+
+  You can ignore this file entirely. Follow the instructions in README.txt.
+
+================================================================================
