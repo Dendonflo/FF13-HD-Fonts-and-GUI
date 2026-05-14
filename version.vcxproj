@@ -36,7 +36,10 @@
       <SDLCheck>false</SDLCheck>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Add SHADOW_ALPHA_FIX to enable the R32F shadow-pass alpha-test fix.
+           Fixes transparent shadows on palm trees / chocobo heads.
+           Leave absent for release until tested on all maps. -->
+      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>
         $(ProjectDir)src;
         $(ProjectDir)Deps\spdlog;
@@ -60,9 +63,11 @@
     <None Include="src\version.def" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\DoFFixer.h" />
     <ClInclude Include="src\HDTextureReplacer.h" />
     <ClInclude Include="src\IDirect3D9.h" />
     <ClInclude Include="src\IDirect3DDevice9.h" />
+    <ClInclude Include="src\PSLogger.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="Deps\MinHook\build\VC16\libMinHook.vcxproj">

@@ -56,6 +56,13 @@ public:
     // Called from CreateTexture hook — evicts stale cache entries for reused pointers.
     void InvalidateTexture(IDirect3DBaseTexture9* pTexture);
 
+#ifdef HDTEX_HOT_RELOAD
+    // Release all GPU textures and pixel data, then re-read DDS files from disk.
+    // Called periodically by the hot-reload background thread so in-progress texture
+    // edits become visible in-game without a restart.
+    void HotReload();
+#endif
+
 private:
     struct HDTextureData {
         UINT hdW, hdH;
@@ -113,6 +120,9 @@ private:
     // Each group owns its LRU and tracks its current active number.
     std::unordered_map<std::string, NumberedGroup> numberedGroups;
 
+    // Root path of hd_textures\ — stored so HotReload() can re-scan without re-running Init().
+    std::wstring m_hdRoot;
+
     // -----------------------------------------------------------------------
     // Namespace classification helpers
     // -----------------------------------------------------------------------
@@ -157,6 +167,9 @@ private:
     void EvictOldest(const std::string& prefix, NumberedGroup& group);
 
     void ScanHDSubdir(const std::wstring& subDirPath, const std::string& prefix);
+    void RescanDisk();
+    void LoadLazyConfig();
+    bool LoadHashDB();
 
     static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                         D3DFORMAT& format, std::vector<uint8_t>& pixelData);
@@ -339,39 +352,60 @@ inline void HDTextureReplacer::ScanHDSubdir(const std::wstring& subDirPath,
 
 inline void HDTextureReplacer::Init(const std::wstring& modDir)
 {
-    std::wstring hdRoot = modDir + L"\\hd_textures";
+    m_hdRoot = modDir + L"\\hd_textures";
 
-    // Read lazy-load prefixes from hd_textures\lazyload_config.txt.
-    // Each non-empty, non-comment line is one prefix (e.g. "map_scene").
+    LoadLazyConfig();
+
+    if (!LoadHashDB())
+        return;
+
+    DWORD attr = GetFileAttributesW(m_hdRoot.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
     {
-        std::wstring cfgPath = hdRoot + L"\\lazyload_config.txt";
-        std::ifstream cfg(cfgPath);
-        if (!cfg.is_open())
-        {
-            spdlog::info("HDTextures: no lazyload_config.txt found, all namespaces preloaded");
-        }
-        else
-        {
-            std::string line;
-            while (std::getline(cfg, line))
-            {
-                // Strip carriage return (Windows line endings)
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                // Strip inline comment
-                auto hash = line.find('#');
-                if (hash != std::string::npos) line = line.substr(0, hash);
+        spdlog::info("HDTextures: no hd_textures directory found");
+        return;
+    }
 
-                std::istringstream iss(line);
-                std::string prefix;
-                if (!(iss >> prefix)) continue;
+    RescanDisk();
 
-                lazyPrefixes.insert(prefix);
+    if (!hdData.empty())
+        spdlog::info("HDTextures: {} HD texture(s) available for replacement", hdData.size());
+}
 
-                size_t cap;
-                if (iss >> cap)
-                    lazyLruCaps[prefix] = cap;
-            }
-        }
+
+// -----------------------------------------------------------------------
+// LoadLazyConfig — read hd_textures\lazyload_config.txt into lazyPrefixes +
+// lazyLruCaps. Safe to call on an already-populated instance; simply adds new
+// entries (call site should clear first for a full hot reload).
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::LoadLazyConfig()
+{
+    std::wstring cfgPath = m_hdRoot + L"\\lazyload_config.txt";
+    std::ifstream cfg(cfgPath);
+    if (!cfg.is_open())
+    {
+        spdlog::info("HDTextures: no lazyload_config.txt found, all namespaces preloaded");
+        return;
+    }
+
+    std::string line;
+    while (std::getline(cfg, line))
+    {
+        // Strip carriage return (Windows line endings)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // Strip inline comment
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+
+        std::istringstream iss(line);
+        std::string prefix;
+        if (!(iss >> prefix)) continue;
+
+        lazyPrefixes.insert(prefix);
+
+        size_t cap;
+        if (iss >> cap)
+            lazyLruCaps[prefix] = cap;
     }
 
     if (!lazyPrefixes.empty())
@@ -387,41 +421,52 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
         }
         spdlog::info("HDTextures: lazy-load prefixes: {}", joined);
     }
+}
 
-    std::wstring hashDBPath = hdRoot + L"\\hash_database.txt";
+
+// -----------------------------------------------------------------------
+// LoadHashDB — read hd_textures\hash_database.txt into hashDB.
+// Returns false if the file is absent (texture replacement stays disabled).
+// -----------------------------------------------------------------------
+inline bool HDTextureReplacer::LoadHashDB()
+{
+    std::wstring hashDBPath = m_hdRoot + L"\\hash_database.txt";
+    std::ifstream f(hashDBPath);
+    if (!f.is_open())
     {
-        std::ifstream f(hashDBPath);
-        if (!f.is_open())
-        {
-            spdlog::info("HDTextures: no hash_database.txt found, texture replacement disabled");
-            return;
-        }
-
-        std::string line;
-        while (std::getline(f, line))
-        {
-            if (line.empty() || line[0] == '#') continue;
-
-            std::istringstream iss(line);
-            std::string hashStr, name;
-            iss >> hashStr >> name;
-            if (hashStr.empty() || name.empty()) continue;
-
-            uint64_t hash = std::strtoull(hashStr.c_str(), nullptr, 16);
-            hashDB[hash] = name;
-        }
-        spdlog::info("HDTextures: loaded {} entries from hash database", hashDB.size());
+        spdlog::info("HDTextures: no hash_database.txt found, texture replacement disabled");
+        return false;
     }
 
-    DWORD attr = GetFileAttributesW(hdRoot.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+    std::string line;
+    while (std::getline(f, line))
     {
-        spdlog::info("HDTextures: no hd_textures directory found");
-        return;
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        std::string hashStr, name;
+        iss >> hashStr >> name;
+        if (hashStr.empty() || name.empty()) continue;
+
+        uint64_t hash = std::strtoull(hashStr.c_str(), nullptr, 16);
+        hashDB[hash] = name;
     }
+    spdlog::info("HDTextures: loaded {} entries from hash database", hashDB.size());
+    return true;
+}
+
+
+// -----------------------------------------------------------------------
+// RescanDisk — iterate hd_textures\ subdirs and call ScanHDSubdir for each.
+// Safe to call multiple times: ScanHDSubdir overwrites existing hdData/lazyPaths
+// entries, so the result is always up-to-date with disk.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::RescanDisk()
+{
+    if (m_hdRoot.empty()) return;
 
     WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW((hdRoot + L"\\*").c_str(), &fd);
+    HANDLE hFind = FindFirstFileW((m_hdRoot + L"\\*").c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
     do
@@ -429,7 +474,7 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-        std::wstring subDirPath = hdRoot + L"\\" + fd.cFileName;
+        std::wstring subDirPath = m_hdRoot + L"\\" + fd.cFileName;
         std::wstring subNameW   = fd.cFileName;
         std::string  subName(subNameW.begin(), subNameW.end());
 
@@ -437,10 +482,45 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
 
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
-
-    if (!hdData.empty())
-        spdlog::info("HDTextures: {} HD texture(s) available for replacement", hdData.size());
 }
+
+
+#ifdef HDTEX_HOT_RELOAD
+// -----------------------------------------------------------------------
+// HotReload — flush all caches and pixel data, then re-read DDS files from disk.
+// Called under g_hdTexCS by the hot-reload background thread.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::HotReload()
+{
+    // Release all GPU-side HD textures (nameToHDTex is sole owner).
+    for (auto& [name, tex] : nameToHDTex)
+        if (tex) tex->Release();
+    nameToHDTex.clear();
+
+    // Clear runtime pointer caches (non-owning, no Release needed).
+    textureMap.clear();
+    checkedTextures.clear();
+    pointerKey.clear();
+    numberedGroups.clear();
+
+    // Drop all pixel data and lazy paths so RescanDisk reads fresh bytes.
+    hdData.clear();
+    lazyPaths.clear();
+
+    // Drop config maps so the re-read picks up any edits to the txt files.
+    hashDB.clear();
+    lazyPrefixes.clear();
+    lazyLruCaps.clear();
+
+    // Re-read everything from disk — config first, then texture assets.
+    LoadLazyConfig();
+    LoadHashDB();
+    RescanDisk();
+
+    spdlog::info("HDTextures: hot reload complete ({} hash(es), {} static texture(s) resident)",
+                 hashDB.size(), hdData.size());
+}
+#endif
 
 
 // -----------------------------------------------------------------------

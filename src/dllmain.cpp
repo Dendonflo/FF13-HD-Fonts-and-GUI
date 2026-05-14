@@ -3,6 +3,8 @@
 #include <memory>
 #include "IDirect3DDevice9.h"
 #include "HDTextureReplacer.h"
+#include "DoFFixer.h"
+#include "PSLogger.h"
 
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/basic_file_sink.h"
@@ -29,6 +31,34 @@ static std::unique_ptr<HDTextureReplacer> g_HDTexturesOwner;
 // Without this lock the unordered_map accesses inside HDTextureReplacer race
 // and corrupt the map state, causing a crash.
 static CRITICAL_SECTION g_hdTexCS;
+
+#ifdef HDTEX_HOT_RELOAD
+static HANDLE       g_hotReloadStop   = nullptr;
+static HANDLE       g_hotReloadThread = nullptr;
+static std::wstring g_shaderDir;
+
+static DWORD WINAPI HotReloadThreadProc(LPVOID)
+{
+    constexpr DWORD kIntervalMs = 1000 *
+#ifdef HDTEX_HOT_RELOAD_INTERVAL_SEC
+        HDTEX_HOT_RELOAD_INTERVAL_SEC;
+#else
+        5;
+#endif
+    while (WaitForSingleObject(g_hotReloadStop, kIntervalMs) == WAIT_TIMEOUT)
+    {
+        // Reload textures, hash database, and lazy-load config under the CS.
+        EnterCriticalSection(&g_hdTexCS);
+        if (g_HDTextures) g_HDTextures->HotReload();
+        LeaveCriticalSection(&g_hdTexCS);
+
+        // Reload shader replacements (hash_table.txt + .bin files).
+        // DofPtrMap is NOT cleared — original ptr→hash associations persist.
+        ReloadShaderHashTable(g_shaderDir);
+    }
+    return 0;
+}
+#endif
 
 // -------------------------------------------------------------------
 // CreateDevice / CreateDeviceEx vtable hooks
@@ -90,13 +120,33 @@ typedef BOOL  (WINAPI *PFN_GetFileVersionInfoA)(LPCSTR, DWORD, DWORD, LPVOID);
 typedef BOOL  (WINAPI *PFN_GetFileVersionInfoW)(LPCWSTR, DWORD, DWORD, LPVOID);
 typedef BOOL  (WINAPI *PFN_VerQueryValueA)(LPCVOID, LPCSTR, LPVOID*, PUINT);
 typedef BOOL  (WINAPI *PFN_VerQueryValueW)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+typedef DWORD (WINAPI *PFN_GetFileVersionInfoSizeExA)(DWORD, LPCSTR, LPDWORD);
+typedef DWORD (WINAPI *PFN_GetFileVersionInfoSizeExW)(DWORD, LPCWSTR, LPDWORD);
+typedef BOOL  (WINAPI *PFN_GetFileVersionInfoExA)(DWORD, LPCSTR, DWORD, DWORD, LPVOID);
+typedef BOOL  (WINAPI *PFN_GetFileVersionInfoExW)(DWORD, LPCWSTR, DWORD, DWORD, LPVOID);
+typedef DWORD (WINAPI *PFN_VerFindFileA)(DWORD, LPSTR, LPSTR, LPSTR, LPSTR, PUINT, LPSTR, PUINT);
+typedef DWORD (WINAPI *PFN_VerFindFileW)(DWORD, LPWSTR, LPWSTR, LPWSTR, LPWSTR, PUINT, LPWSTR, PUINT);
+typedef DWORD (WINAPI *PFN_VerInstallFileA)(DWORD, LPSTR, LPSTR, LPSTR, LPSTR, LPSTR, LPSTR, PUINT);
+typedef DWORD (WINAPI *PFN_VerInstallFileW)(DWORD, LPWSTR, LPWSTR, LPWSTR, LPWSTR, LPWSTR, LPWSTR, PUINT);
+typedef DWORD (WINAPI *PFN_VerLanguageNameA)(DWORD, LPSTR, DWORD);
+typedef DWORD (WINAPI *PFN_VerLanguageNameW)(DWORD, LPWSTR, DWORD);
 
-static PFN_GetFileVersionInfoSizeA Real_GetFileVersionInfoSizeA = nullptr;
-static PFN_GetFileVersionInfoSizeW Real_GetFileVersionInfoSizeW = nullptr;
-static PFN_GetFileVersionInfoA     Real_GetFileVersionInfoA     = nullptr;
-static PFN_GetFileVersionInfoW     Real_GetFileVersionInfoW     = nullptr;
-static PFN_VerQueryValueA          Real_VerQueryValueA          = nullptr;
-static PFN_VerQueryValueW          Real_VerQueryValueW          = nullptr;
+static PFN_GetFileVersionInfoSizeA   Real_GetFileVersionInfoSizeA   = nullptr;
+static PFN_GetFileVersionInfoSizeW   Real_GetFileVersionInfoSizeW   = nullptr;
+static PFN_GetFileVersionInfoA       Real_GetFileVersionInfoA       = nullptr;
+static PFN_GetFileVersionInfoW       Real_GetFileVersionInfoW       = nullptr;
+static PFN_VerQueryValueA            Real_VerQueryValueA            = nullptr;
+static PFN_VerQueryValueW            Real_VerQueryValueW            = nullptr;
+static PFN_GetFileVersionInfoSizeExA Real_GetFileVersionInfoSizeExA = nullptr;
+static PFN_GetFileVersionInfoSizeExW Real_GetFileVersionInfoSizeExW = nullptr;
+static PFN_GetFileVersionInfoExA     Real_GetFileVersionInfoExA     = nullptr;
+static PFN_GetFileVersionInfoExW     Real_GetFileVersionInfoExW     = nullptr;
+static PFN_VerFindFileA              Real_VerFindFileA              = nullptr;
+static PFN_VerFindFileW              Real_VerFindFileW              = nullptr;
+static PFN_VerInstallFileA           Real_VerInstallFileA           = nullptr;
+static PFN_VerInstallFileW           Real_VerInstallFileW           = nullptr;
+static PFN_VerLanguageNameA          Real_VerLanguageNameA          = nullptr;
+static PFN_VerLanguageNameW          Real_VerLanguageNameW          = nullptr;
 
 static void LoadRealVersionDll()
 {
@@ -106,12 +156,22 @@ static void LoadRealVersionDll()
     wcscat_s(sysPath, MAX_PATH, L"\\version.dll");
     g_RealVersion = LoadLibraryW(sysPath);
     if (!g_RealVersion) return;
-    Real_GetFileVersionInfoSizeA = (PFN_GetFileVersionInfoSizeA)GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeA");
-    Real_GetFileVersionInfoSizeW = (PFN_GetFileVersionInfoSizeW)GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeW");
-    Real_GetFileVersionInfoA     = (PFN_GetFileVersionInfoA)    GetProcAddress(g_RealVersion, "GetFileVersionInfoA");
-    Real_GetFileVersionInfoW     = (PFN_GetFileVersionInfoW)    GetProcAddress(g_RealVersion, "GetFileVersionInfoW");
-    Real_VerQueryValueA          = (PFN_VerQueryValueA)         GetProcAddress(g_RealVersion, "VerQueryValueA");
-    Real_VerQueryValueW          = (PFN_VerQueryValueW)         GetProcAddress(g_RealVersion, "VerQueryValueW");
+    Real_GetFileVersionInfoSizeA   = (PFN_GetFileVersionInfoSizeA)  GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeA");
+    Real_GetFileVersionInfoSizeW   = (PFN_GetFileVersionInfoSizeW)  GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeW");
+    Real_GetFileVersionInfoA       = (PFN_GetFileVersionInfoA)      GetProcAddress(g_RealVersion, "GetFileVersionInfoA");
+    Real_GetFileVersionInfoW       = (PFN_GetFileVersionInfoW)      GetProcAddress(g_RealVersion, "GetFileVersionInfoW");
+    Real_VerQueryValueA            = (PFN_VerQueryValueA)           GetProcAddress(g_RealVersion, "VerQueryValueA");
+    Real_VerQueryValueW            = (PFN_VerQueryValueW)           GetProcAddress(g_RealVersion, "VerQueryValueW");
+    Real_GetFileVersionInfoSizeExA = (PFN_GetFileVersionInfoSizeExA)GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeExA");
+    Real_GetFileVersionInfoSizeExW = (PFN_GetFileVersionInfoSizeExW)GetProcAddress(g_RealVersion, "GetFileVersionInfoSizeExW");
+    Real_GetFileVersionInfoExA     = (PFN_GetFileVersionInfoExA)    GetProcAddress(g_RealVersion, "GetFileVersionInfoExA");
+    Real_GetFileVersionInfoExW     = (PFN_GetFileVersionInfoExW)    GetProcAddress(g_RealVersion, "GetFileVersionInfoExW");
+    Real_VerFindFileA              = (PFN_VerFindFileA)             GetProcAddress(g_RealVersion, "VerFindFileA");
+    Real_VerFindFileW              = (PFN_VerFindFileW)             GetProcAddress(g_RealVersion, "VerFindFileW");
+    Real_VerInstallFileA           = (PFN_VerInstallFileA)          GetProcAddress(g_RealVersion, "VerInstallFileA");
+    Real_VerInstallFileW           = (PFN_VerInstallFileW)          GetProcAddress(g_RealVersion, "VerInstallFileW");
+    Real_VerLanguageNameA          = (PFN_VerLanguageNameA)         GetProcAddress(g_RealVersion, "VerLanguageNameA");
+    Real_VerLanguageNameW          = (PFN_VerLanguageNameW)         GetProcAddress(g_RealVersion, "VerLanguageNameW");
 }
 
 extern "C" {
@@ -133,6 +193,36 @@ BOOL  WINAPI VerStub_VerQueryValueA(LPVOID b, LPCSTR s, LPVOID* p, PUINT u) {
 }
 BOOL  WINAPI VerStub_VerQueryValueW(LPVOID b, LPCWSTR s, LPVOID* p, PUINT u) {
     return Real_VerQueryValueW ? Real_VerQueryValueW(b, s, p, u) : FALSE;
+}
+DWORD WINAPI VerStub_GetFileVersionInfoSizeExA(DWORD f, LPCSTR n, LPDWORD h) {
+    return Real_GetFileVersionInfoSizeExA ? Real_GetFileVersionInfoSizeExA(f, n, h) : 0;
+}
+DWORD WINAPI VerStub_GetFileVersionInfoSizeExW(DWORD f, LPCWSTR n, LPDWORD h) {
+    return Real_GetFileVersionInfoSizeExW ? Real_GetFileVersionInfoSizeExW(f, n, h) : 0;
+}
+BOOL  WINAPI VerStub_GetFileVersionInfoExA(DWORD f, LPCSTR n, DWORD h, DWORD l, LPVOID d) {
+    return Real_GetFileVersionInfoExA ? Real_GetFileVersionInfoExA(f, n, h, l, d) : FALSE;
+}
+BOOL  WINAPI VerStub_GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, LPVOID d) {
+    return Real_GetFileVersionInfoExW ? Real_GetFileVersionInfoExW(f, n, h, l, d) : FALSE;
+}
+DWORD WINAPI VerStub_VerFindFileA(DWORD f, LPSTR n, LPSTR wd, LPSTR ld, LPSTR df, PUINT dfl, LPSTR dd, PUINT ddl) {
+    return Real_VerFindFileA ? Real_VerFindFileA(f, n, wd, ld, df, dfl, dd, ddl) : 0;
+}
+DWORD WINAPI VerStub_VerFindFileW(DWORD f, LPWSTR n, LPWSTR wd, LPWSTR ld, LPWSTR df, PUINT dfl, LPWSTR dd, PUINT ddl) {
+    return Real_VerFindFileW ? Real_VerFindFileW(f, n, wd, ld, df, dfl, dd, ddl) : 0;
+}
+DWORD WINAPI VerStub_VerInstallFileA(DWORD f, LPSTR sf, LPSTR df, LPSTR sd, LPSTR dd, LPSTR cd, LPSTR n, PUINT nl) {
+    return Real_VerInstallFileA ? Real_VerInstallFileA(f, sf, df, sd, dd, cd, n, nl) : 0;
+}
+DWORD WINAPI VerStub_VerInstallFileW(DWORD f, LPWSTR sf, LPWSTR df, LPWSTR sd, LPWSTR dd, LPWSTR cd, LPWSTR n, PUINT nl) {
+    return Real_VerInstallFileW ? Real_VerInstallFileW(f, sf, df, sd, dd, cd, n, nl) : 0;
+}
+DWORD WINAPI VerStub_VerLanguageNameA(DWORD wLang, LPSTR szLang, DWORD nSize) {
+    return Real_VerLanguageNameA ? Real_VerLanguageNameA(wLang, szLang, nSize) : 0;
+}
+DWORD WINAPI VerStub_VerLanguageNameW(DWORD wLang, LPWSTR szLang, DWORD nSize) {
+    return Real_VerLanguageNameW ? Real_VerLanguageNameW(wLang, szLang, nSize) : 0;
 }
 
 } // extern "C"
@@ -399,12 +489,32 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
             spdlog::info("HDTextures mod loaded");
         } catch (...) {}
 
+        LoadShaderHashTable(dllDir + L"\\hd_textures_shaders");
+
+        // Always set dump dir — used by HDTEX_DUMP_SHADERS.
+        PSLogger::SetDumpDir(dllDir + L"\\shader_dumps");
+#ifdef HDTEX_DUMP_SHADERS
+        spdlog::info("HDTextures: shader dump enabled -> shader_dumps\\");
+#endif
+
 #ifndef HDTEX_DIAG_NO_CONSTRUCT
         try {
             g_HDTexturesOwner = std::make_unique<HDTextureReplacer>();
             g_HDTextures      = g_HDTexturesOwner.get();
 #ifndef HDTEX_DIAG_SKIP_HD_INIT
             g_HDTextures->Init(dllDir);
+#ifdef HDTEX_HOT_RELOAD
+            g_shaderDir       = dllDir + L"\\hd_textures_shaders";
+            g_hotReloadStop   = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+            g_hotReloadThread = CreateThread(nullptr, 0, HotReloadThreadProc, nullptr, 0, nullptr);
+            spdlog::info("HDTextures: hot reload enabled (interval {}s) — textures, hashes, shaders",
+#ifdef HDTEX_HOT_RELOAD_INTERVAL_SEC
+                HDTEX_HOT_RELOAD_INTERVAL_SEC
+#else
+                5
+#endif
+            );
+#endif
 #else
             spdlog::info("HDTextures: Init() SKIPPED (diagnostic build)");
 #endif
@@ -452,6 +562,11 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
     }
     else if (fdwReason == DLL_PROCESS_DETACH)
     {
+#ifdef HDTEX_HOT_RELOAD
+        if (g_hotReloadStop)   { SetEvent(g_hotReloadStop); }
+        if (g_hotReloadThread) { WaitForSingleObject(g_hotReloadThread, 2000); CloseHandle(g_hotReloadThread); g_hotReloadThread = nullptr; }
+        if (g_hotReloadStop)   { CloseHandle(g_hotReloadStop); g_hotReloadStop = nullptr; }
+#endif
 #ifndef HDTEX_DISABLE_D3D_HOOKS
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();

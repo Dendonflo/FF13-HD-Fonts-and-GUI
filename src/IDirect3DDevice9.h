@@ -2,8 +2,15 @@
 
 #include <d3d9.h>
 #include <memory>
+#include <algorithm>
+#include <fstream>
+#include <unordered_map>
+#include <unordered_set>
 #include "HDTextureReplacer.h"
 #include "spdlog/spdlog.h"
+#include "PSLogger.h"
+#include "DoFFixer.h"
+#include "MinHook.h"
 
 // Diagnostic-only: log every device method called by the game, so we can
 // identify the last method invoked before a crash. Define HDTEX_TRACE_DEVICE
@@ -14,6 +21,8 @@
   #define DEV_TRACE(name) ((void)0)
 #endif
 
+
+// ---------------------------------------------------------------------------
 // IDirect3DDevice9 proxy that also implements IDirect3DDevice9Ex.
 //
 // WHY IDirect3DDevice9Ex: the system d3d9.dll returns IDirect3DDevice9Ex objects
@@ -25,7 +34,10 @@
 class IDirect3DDevice9Proxy : public IDirect3DDevice9Ex {
 public:
     IDirect3DDevice9Proxy(IDirect3DDevice9Ex* pReal, HDTextureReplacer* pTexReplacer)
-        : m_pReal(pReal), m_pTexReplacer(pTexReplacer), m_refCount(1) {}
+        : m_pReal(pReal), m_pTexReplacer(pTexReplacer), m_refCount(1)
+    {
+        DoFFixerRegistry().push_back(&m_dofFixer);
+    }
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
@@ -87,6 +99,9 @@ public:
                 m_pReal->Release();
                 m_pReal = nullptr;
             }
+            // Unregister from the hot-reload fixer registry.
+            auto& reg = DoFFixerRegistry();
+            reg.erase(std::remove(reg.begin(), reg.end(), &m_dofFixer), reg.end());
         }
         return ref;
     }
@@ -243,7 +258,27 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget) override {
-        DEV_TRACE("SetRenderTarget"); return m_pReal->SetRenderTarget(RenderTargetIndex, pRenderTarget);
+        DEV_TRACE("SetRenderTarget");
+#ifdef SHADOW_ALPHA_FIX
+        if (RenderTargetIndex == 0) {
+            bool isR32F = false;
+            if (pRenderTarget) {
+                D3DSURFACE_DESC desc;
+                if (SUCCEEDED(pRenderTarget->GetDesc(&desc)))
+                    isR32F = (desc.Format == D3DFMT_R32F);
+            }
+            if (isR32F != m_inShadowPass) {
+                m_inShadowPass = isR32F;
+                if (isR32F) {
+                    m_pReal->GetRenderState(D3DRS_ALPHATESTENABLE, &m_savedAlphaTest);
+                    m_pReal->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+                } else {
+                    m_pReal->SetRenderState(D3DRS_ALPHATESTENABLE, m_savedAlphaTest);
+                }
+            }
+        }
+#endif
+        return m_pReal->SetRenderTarget(RenderTargetIndex, pRenderTarget);
     }
 
     HRESULT STDMETHODCALLTYPE GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget) override {
@@ -260,6 +295,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE BeginScene() override {
         DEV_TRACE("BeginScene");
+#ifdef HDTEX_LOG_SHADERS
+        m_drawCounter = 0;
+#endif
         return m_pReal->BeginScene();
     }
 
@@ -326,7 +364,35 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) override {
-        DEV_TRACE("SetRenderState"); return m_pReal->SetRenderState(State, Value);
+        DEV_TRACE("SetRenderState");
+#ifdef SHADOW_ALPHA_FIX
+        if (m_inShadowPass && State == D3DRS_ALPHATESTENABLE) Value = TRUE;
+#endif
+#ifdef HDTEX_LOG_BLEND
+        if (State == D3DRS_SRCBLEND || State == D3DRS_DESTBLEND) {
+            const char* name = "UNKNOWN";
+            switch (static_cast<D3DBLEND>(Value)) {
+                case D3DBLEND_ZERO:            name = "ZERO";            break;
+                case D3DBLEND_ONE:             name = "ONE";             break;
+                case D3DBLEND_SRCCOLOR:        name = "SRCCOLOR";        break;
+                case D3DBLEND_INVSRCCOLOR:     name = "INVSRCCOLOR";     break;
+                case D3DBLEND_SRCALPHA:        name = "SRCALPHA";        break;
+                case D3DBLEND_INVSRCALPHA:     name = "INVSRCALPHA";     break;
+                case D3DBLEND_DESTALPHA:       name = "DESTALPHA";       break;
+                case D3DBLEND_INVDESTALPHA:    name = "INVDESTALPHA";    break;
+                case D3DBLEND_DESTCOLOR:       name = "DESTCOLOR";       break;
+                case D3DBLEND_INVDESTCOLOR:    name = "INVDESTCOLOR";    break;
+                case D3DBLEND_SRCALPHASAT:     name = "SRCALPHASAT";     break;
+                case D3DBLEND_BLENDFACTOR:     name = "BLENDFACTOR";     break;
+                case D3DBLEND_INVBLENDFACTOR:  name = "INVBLENDFACTOR";  break;
+                default: break;
+            }
+            spdlog::info("SetRenderState {}={} shader={:016x}",
+                State == D3DRS_SRCBLEND ? "SRCBLEND" : "DESTBLEND",
+                name, m_blendActiveHash);
+        }
+#endif
+        return m_pReal->SetRenderState(State, Value);
     }
 
     HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State, DWORD* pValue) override {
@@ -421,19 +487,29 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) override {
-        DEV_TRACE("DrawPrimitive"); return m_pReal->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+        DEV_TRACE("DrawPrimitive");
+#ifdef HDTEX_LOG_SHADERS
+        PSLogger::LogDraw("DrawPrimitive", PrimitiveType, PrimitiveCount, m_psActiveHash, m_drawCounter);
+#endif
+        return m_pReal->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
 
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount) override {
-        DEV_TRACE("DrawIndexedPrimitive"); return m_pReal->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
+        DEV_TRACE("DrawIndexedPrimitive");
+        return m_pReal->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
     }
 
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
-        DEV_TRACE("DrawPrimitiveUP"); return m_pReal->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+        DEV_TRACE("DrawPrimitiveUP");
+#ifdef HDTEX_LOG_SHADERS
+        PSLogger::LogDraw("DrawPrimitiveUP", PrimitiveType, PrimitiveCount, m_psActiveHash, m_drawCounter);
+#endif
+        return m_pReal->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
 
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
-        DEV_TRACE("DrawIndexedPrimitiveUP"); return m_pReal->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+        DEV_TRACE("DrawIndexedPrimitiveUP");
+        return m_pReal->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }
 
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override {
@@ -521,11 +597,35 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override {
-        DEV_TRACE("CreatePixelShader"); return m_pReal->CreatePixelShader(pFunction, ppShader);
+        DEV_TRACE("CreatePixelShader");
+        HRESULT hr = m_pReal->CreatePixelShader(pFunction, ppShader);
+        if (SUCCEEDED(hr) && ppShader && *ppShader) {
+#ifdef HDTEX_LOG_SHADERS
+            PSLogger::Log(pFunction, *ppShader); // also calls DumpShader if HDTEX_DUMP_SHADERS
+#elif defined(HDTEX_DUMP_SHADERS)
+            PSLogger::DumpShader(pFunction, PSLogger::HashBytecode(pFunction));
+#endif
+#ifdef HDTEX_LOG_BLEND
+            m_blendPtrMap[*ppShader] = DoF_HashBytecode(pFunction);
+#endif
+            m_dofFixer.OnCreate(pFunction, *ppShader);
+        }
+        return hr;
     }
 
     HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
-        DEV_TRACE("SetPixelShader"); return m_pReal->SetPixelShader(pShader);
+        DEV_TRACE("SetPixelShader");
+#ifdef HDTEX_LOG_SHADERS
+        PSLogger::LogSetPS(pShader, m_psActiveHash);
+#endif
+#ifdef HDTEX_LOG_BLEND
+        {
+            auto it = m_blendPtrMap.find(pShader);
+            m_blendActiveHash = (it != m_blendPtrMap.end()) ? it->second : 0;
+        }
+#endif
+        pShader = m_dofFixer.Redirect(pShader, m_pReal);
+        return m_pReal->SetPixelShader(pShader);
     }
 
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override {
@@ -626,4 +726,18 @@ private:
     IDirect3DDevice9Ex* m_pReal;
     HDTextureReplacer*  m_pTexReplacer;
     volatile LONG       m_refCount;
+    DoFFixer            m_dofFixer;
+#ifdef SHADOW_ALPHA_FIX
+    bool                m_inShadowPass   = false;
+    DWORD               m_savedAlphaTest = FALSE;
+#endif
+#ifdef HDTEX_LOG_BLEND
+    std::unordered_map<IDirect3DPixelShader9*, uint64_t> m_blendPtrMap;
+    uint64_t            m_blendActiveHash = 0;
+#endif
+#ifdef HDTEX_LOG_SHADERS
+    uint64_t  m_psActiveHash = 0;
+    uint32_t  m_drawCounter  = 0;
+#endif
+
 };

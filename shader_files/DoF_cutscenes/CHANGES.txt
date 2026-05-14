@@ -1,0 +1,50 @@
+FF13-2 Cutscene DoF Shader Improvements
+========================================
+
+
+STEP 1 — Near blur gather (8b0d63a81922561b)
+---------------------------------------------
+Original: 4-tap cross filter (up/down/left/right, 1 texel apart).
+          Very coarse blur, visible as a blocky square pattern on
+          near-blurred objects.
+
+Improved: 19-tap circular kernel — centre + ring of 6 + ring of 12.
+          Produces round, smooth near blur instead of a cross shape.
+          Kernel radius is driven by the render target texel size so
+          it scales correctly at any resolution.
+
+
+STEP 2 — Near blur spread / dilation (b32c3447f7a5418c)
+---------------------------------------------------------
+Original: Dilates the near CoC (blur radius) outward using the formula
+          2 × max(blended, centre) − centre.
+          This formula is correct in intent but was never clamped, so it
+          could produce CoC values above 1.0 which fed into step 3.
+
+Improved: Identical formula, identical tap positions and blend weights,
+          but the result is wrapped in saturate() so CoC stays in [0, 1].
+          This prevents the compositor from receiving out-of-range values
+          that caused objects to appear over-blurred or smeared when they
+          should have been sharp.
+
+
+STEP 3 — Final compositor (67f7f77335ff7a82)
+---------------------------------------------
+Original: Used an additive blend (sharp + nearBlur × weight) which
+          over-brightened the image and did not correctly fade between
+          sharp and blurred layers. Far DoF was effectively disabled
+          when near CoC was zero. Used 5 taps at 0.5–1.5 texels for
+          the far blur — very narrow and resolution-dependent.
+
+Improved: Replaced with two clean lerps:
+            1. lerp(sharp, farBlur, farCoc)      — far field
+            2. lerp(above, nearBlur, nearCoc)    — near field on top
+          This means in-focus areas stay sharp, far objects fade into
+          the far blur proportionally, and near objects fade into the
+          near blur. Near blur correctly takes priority over far blur.
+
+          Far blur kernel widened from 5 taps to 9 taps (centre + 8
+          surrounding at 1.5 texels), giving a softer far field.
+
+          Both CoC values are clamped with saturate() as an additional
+          safety measure against any residual overflow from step 2.

@@ -1,9 +1,19 @@
 LIBRARY version
 
 EXPORTS
-    GetFileVersionInfoSizeA = VerStub_GetFileVersionInfoSizeA
-    GetFileVersionInfoSizeW = VerStub_GetFileVersionInfoSizeW
-    GetFileVersionInfoA     = VerStub_GetFileVersionInfoA
-    GetFileVersionInfoW     = VerStub_GetFileVersionInfoW
-    VerQueryValueA          = VerStub_VerQueryValueA
-    VerQueryValueW          = VerStub_VerQueryValueW
+    GetFileVersionInfoSizeA   = VerStub_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeW   = VerStub_GetFileVersionInfoSizeW
+    GetFileVersionInfoA       = VerStub_GetFileVersionInfoA
+    GetFileVersionInfoW       = VerStub_GetFileVersionInfoW
+    VerQueryValueA            = VerStub_VerQueryValueA
+    VerQueryValueW            = VerStub_VerQueryValueW
+    GetFileVersionInfoSizeExA = VerStub_GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = VerStub_GetFileVersionInfoSizeExW
+    GetFileVersionInfoExA     = VerStub_GetFileVersionInfoExA
+    GetFileVersionInfoExW     = VerStub_GetFileVersionInfoExW
+    VerFindFileA              = VerStub_VerFindFileA
+    VerFindFileW              = VerStub_VerFindFileW
+    VerInstallFileA           = VerStub_VerInstallFileA
+    VerInstallFileW           = VerStub_VerInstallFileW
+    VerLanguageNameA          = VerStub_VerLanguageNameA
+    VerLanguageNameW          = VerStub_VerLanguageNameW

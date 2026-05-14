@@ -1,0 +1,4 @@
+map          256  # Map tiles + Title screen
+savefiles    16   # Save files 
+face         16    # Characters and monsters portraits (2 characters in inventory + 3 monsters in team + 1 at a time)
+
