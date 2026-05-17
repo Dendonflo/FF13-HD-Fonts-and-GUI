@@ -42,6 +42,9 @@ REQUIREMENTS
   The Nova Chrysalia Launcher will automatically patch the game for 4GB
   https://github.com/LR-Research-Team/Datalog/wiki/%5BGUIDE%5D-Setting-up-the-Nova-Chrysalia-Mod-manager
 
+
+  The automatic costume changes in the main menu requires using Nova Chrysalia Launcher in Unpacked mode
+
 --------------------------------------------------------------------------------
 INSTALLATION
 --------------------------------------------------------------------------------

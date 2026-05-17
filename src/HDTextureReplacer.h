@@ -56,6 +56,20 @@ public:
     // Called from CreateTexture hook — evicts stale cache entries for reused pointers.
     void InvalidateTexture(IDirect3DBaseTexture9* pTexture);
 
+    // Called from the CostumeTracker callback (under g_hdTexCS) to swap the pixel
+    // data for one gui_resident face texture without a full reload.
+    // Releases the existing GPU texture for texName so it will be re-uploaded on the
+    // next SetTexture call that references it. Leaves the original-pointer caches
+    // intact — they are invalidated naturally when the game re-binds the texture.
+    void SwapCostumeTexture(const std::string& texName,
+                            UINT hdW, UINT hdH, D3DFORMAT format,
+                            std::vector<uint8_t> pixels);
+
+    // Parse DDS header + pixel data from disk. Public so dllmain's costume callback
+    // can call it outside the critical section before entering to do the swap.
+    static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
+                        D3DFORMAT& format, std::vector<uint8_t>& pixelData);
+
 #ifdef HDTEX_HOT_RELOAD
     // Release all GPU textures and pixel data, then re-read DDS files from disk.
     // Called periodically by the hot-reload background thread so in-progress texture
@@ -170,9 +184,6 @@ private:
     void RescanDisk();
     void LoadLazyConfig();
     bool LoadHashDB();
-
-    static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
-                        D3DFORMAT& format, std::vector<uint8_t>& pixelData);
 
     static uint64_t FNV1a64(const uint8_t* data, size_t len,
                              uint64_t h = 14695981039346656037ULL);
@@ -857,6 +868,52 @@ inline IDirect3DTexture9* HDTextureReplacer::CreateHDTexture(IDirect3DDevice9* p
 
     hdTex->UnlockRect(0);
     return hdTex;
+}
+
+
+// -----------------------------------------------------------------------
+// SwapCostumeTexture — hot-swap pixel data for one named gui_resident texture.
+//
+// Releases the existing GPU texture so it will be re-created on the next
+// SetTexture call that references it. Original-pointer caches (textureMap,
+// checkedTextures, pointerKey) are cleared for any entry that pointed at
+// the old GPU object so the rehash and re-upload path is taken cleanly.
+//
+// Must be called under g_hdTexCS.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::SwapCostumeTexture(const std::string& texName,
+                                                   UINT hdW, UINT hdH,
+                                                   D3DFORMAT format,
+                                                   std::vector<uint8_t> pixels)
+{
+    // Release existing GPU texture and evict every pointer that referenced it.
+    auto nit = nameToHDTex.find(texName);
+    if (nit != nameToHDTex.end()) {
+        IDirect3DTexture9* oldTex = nit->second;
+
+        // Remove all fast-path cache entries pointing at this GPU texture.
+        std::vector<IDirect3DBaseTexture9*> stale;
+        for (auto& [ptr, hdTex] : textureMap)
+            if (hdTex == oldTex) stale.push_back(ptr);
+        for (auto ptr : stale) {
+            textureMap.erase(ptr);
+            checkedTextures.erase(ptr);
+            pointerKey.erase(ptr);
+        }
+
+        if (oldTex) oldTex->Release();
+        nameToHDTex.erase(nit);
+    }
+
+    // Install new pixel data.
+    HDTextureData& hd = hdData[texName];
+    hd.hdW       = hdW;
+    hd.hdH       = hdH;
+    hd.format    = format;
+    hd.pixelData = std::move(pixels);
+
+    spdlog::info("CostumeTracker: texture '{}' swapped ({}x{}) — will upload on next bind",
+                 texName, hdW, hdH);
 }
 
 

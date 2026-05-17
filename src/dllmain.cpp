@@ -10,6 +10,7 @@
 #include "spdlog/sinks/basic_file_sink.h"
 
 #include "MinHook.h"
+#include "CostumeTracker.h"
 
 // -------------------------------------------------------------------
 // Diagnostic switches (controlled from version.vcxproj PreprocessorDefinitions)
@@ -31,6 +32,52 @@ static std::unique_ptr<HDTextureReplacer> g_HDTexturesOwner;
 // Without this lock the unordered_map accesses inside HDTextureReplacer race
 // and corrupt the map state, causing a crash.
 static CRITICAL_SECTION g_hdTexCS;
+
+// Directory containing this DLL (set in DllMain before any hook fires).
+// Used by the costume swap callback to build paths to costume DDS files.
+static std::wstring g_hdTexDir;
+
+#ifdef COSTUME_TRACKING
+// ---------------------------------------------------------------------------
+// OnCostumeChanged — CostumeTracker callback.
+//
+// Fired (on the CreateFileW intercept thread, outside g_hdTexCS) whenever
+// the game loads a costume model file. Reads the matching DDS from disk,
+// then enters g_hdTexCS to swap the pixel data in HDTextureReplacer.
+//
+// Expected file:
+//   <dllDir>\hd_textures\gui_resident\costumes\<charPath>\<folderName>.dds
+// ---------------------------------------------------------------------------
+static void OnCostumeChanged(const char* charPath,
+                              const char* texSuffix,
+                              const char* folderName)
+{
+    // Build DDS path (outside CS — file I/O should not hold the lock).
+    std::wstring ddsPath = g_hdTexDir + L"\\hd_textures\\gui_resident\\costumes\\";
+    for (const char* p = charPath;   *p; ++p) ddsPath += static_cast<wchar_t>(*p);
+    ddsPath += L"\\";
+    for (const char* p = folderName; *p; ++p) ddsPath += static_cast<wchar_t>(*p);
+    ddsPath += L".dds";
+
+    UINT hdW = 0, hdH = 0;
+    D3DFORMAT format = D3DFMT_UNKNOWN;
+    std::vector<uint8_t> pixels;
+
+    if (!HDTextureReplacer::ReadDDS(ddsPath, hdW, hdH, format, pixels)) {
+        spdlog::warn("CostumeTracker: DDS not found or unreadable — {}\\{}",
+                     charPath, folderName);
+        return;
+    }
+
+    // texName matches the key in hashDB / hdData, e.g. "gui_resident/face_serah"
+    std::string texName = std::string("gui_resident/face_") + texSuffix;
+
+    EnterCriticalSection(&g_hdTexCS);
+    if (g_HDTextures)
+        g_HDTextures->SwapCostumeTexture(texName, hdW, hdH, format, std::move(pixels));
+    LeaveCriticalSection(&g_hdTexCS);
+}
+#endif // COSTUME_TRACKING
 
 #ifdef HDTEX_HOT_RELOAD
 static HANDLE       g_hotReloadStop   = nullptr;
@@ -478,6 +525,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
         LoadRealVersionDll();
 
         std::wstring dllDir = GetDllDir();
+        g_hdTexDir = dllDir;
         std::string logPath =
             std::string(dllDir.begin(), dllDir.end()) + "\\HDTextures.log";
         try {
@@ -556,6 +604,12 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
         } else {
             spdlog::error("HDTextures: d3d9.dll not found");
         }
+
+#ifdef COSTUME_TRACKING
+        g_costumeSwapCallback = OnCostumeChanged;
+        InstallCostumeTrackerHook();
+#endif
+
 #else
         spdlog::info("HDTextures: D3D hooks DISABLED (diagnostic build)");
 #endif
