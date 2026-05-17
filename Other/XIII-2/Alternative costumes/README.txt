@@ -1,0 +1,3 @@
+- Select a character, then a costume
+- Drop the hd_textures folder in the FINAL FANTASY XIII-2\alba_data\prog\win\bin folder
+- Choose yes when prompted to overwrite files.
