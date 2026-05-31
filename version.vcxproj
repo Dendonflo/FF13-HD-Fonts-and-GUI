@@ -38,8 +38,10 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <!-- Add SHADOW_ALPHA_FIX to enable the R32F shadow-pass alpha-test fix.
            Fixes transparent shadows on palm trees / chocobo heads.
-           Leave absent for release until tested on all maps. -->
-      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+           Leave absent for release until tested on all maps.
+           Add COSTUME_TRACKING to enable CreateFileW hook that detects costume
+           model loads (cXXX.win32.trb) and logs costume changes. FF13-2 only. -->
+      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;HDTEX_HOT_RELOAD;HDTEX_ASSET_SUBDIR=L&quot;weiss_data&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>
         $(ProjectDir)src;
         $(ProjectDir)Deps\spdlog;

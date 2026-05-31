@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -10,6 +11,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cctype>
+#include <mutex>
+#include <atomic>
 #include <d3d9.h>
 
 #include "spdlog/spdlog.h"
@@ -42,12 +45,22 @@
 class HDTextureReplacer
 {
 public:
+    HDTextureReplacer()  = default;
+    ~HDTextureReplacer() { StopPreloadThread(); StopHashThread(); }
+
     // modDir: directory containing d3d9.dll (white_data\prog\win\bin\).
     // Reads hd_textures\lazyload_config.txt for lazy-load prefixes,
     // and hd_textures\hash_database.txt for the hash → name mapping.
     void Init(const std::wstring& modDir);
+    // Fast-path read-only lookup — called under shared (SRW read) lock.
+    // Returns the texture to bind (HD replacement or original) if the result is
+    // already cached, or nullptr if the texture hasn't been seen before and a full
+    // OnSetTexture pass is needed (which will acquire the exclusive lock).
+    IDirect3DBaseTexture9* TryFastPath(IDirect3DBaseTexture9* pTexture);
+
     // Called from SetTexture hook — identifies texture by hash, swaps if HD available.
     // Needs device pointer to create HD textures on first match.
+    // Always called under exclusive (SRW write) lock.
     IDirect3DBaseTexture9* OnSetTexture(IDirect3DDevice9* pDevice,
                                         IDirect3DBaseTexture9* pTexture);
 
@@ -69,6 +82,17 @@ public:
     // can call it outside the critical section before entering to do the swap.
     static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                         D3DFORMAT& format, std::vector<uint8_t>& pixelData);
+
+#ifdef HDTEX_DUMP_TEXTURES
+    // Set output directory for HDTEX_DUMP_TEXTURES. Called once from DllMain.
+    static void SetTexDumpDir(const std::wstring& dir);
+private:
+    static std::wstring& TexDumpDir();
+    static void DumpTextureDDS(uint64_t hash, D3DFORMAT fmt, UINT w, UINT h,
+                               const void* pBits, UINT pitch,
+                               UINT rowPitch, UINT rowCount);
+public:
+#endif
 
 #ifdef HDTEX_HOT_RELOAD
     // Release all GPU textures and pixel data, then re-read DDS files from disk.
@@ -138,6 +162,101 @@ private:
     std::wstring m_hdRoot;
 
     // -----------------------------------------------------------------------
+    // Async tile preloader
+    //
+    // Disk I/O for lazy-loaded map tiles is moved off the render thread.
+    // When OnSetTexture detects a namespace switch, QueueNamespacePreload()
+    // immediately posts all tiles for the incoming namespace to the background
+    // thread. The render thread only does fast GPU uploads (CreateTexture +
+    // UpdateTexture) once data arrives in preloadReady_; it never calls
+    // ReadDDS inline.
+    //
+    // Lock ordering (never hold both simultaneously from the same thread
+    // except: SRWLock(exclusive) → preloadMtx_ is allowed since the preload
+    // thread never acquires the SRWLock):
+    //   Render thread:  SRWLock (via dllmain) → preloadMtx_ (brief)
+    //   Preload thread: preloadMtx_ only
+    // -----------------------------------------------------------------------
+    struct PreloadJob {
+        std::string  texName;
+        std::wstring filePath;
+    };
+
+    std::mutex                              preloadMtx_;
+    std::deque<PreloadJob>                  preloadJobs_;
+    std::unordered_set<std::string>         preloadQueued_;  // in queue or being loaded
+    std::unordered_map<std::string,
+                       HDTextureData>       preloadReady_;   // loaded, awaiting GPU upload
+    HANDLE                                  preloadThread_   = nullptr;
+    HANDLE                                  preloadSemaphore_= nullptr;
+    std::atomic<bool>                       preloadStop_     { false };
+
+    void StartPreloadThread();
+    void StopPreloadThread();
+    void QueueTilePreload(const std::string& texName, const std::wstring& path);
+    void QueueNamespacePreload(const std::string& prefix, const std::string& number);
+    static DWORD WINAPI PreloadThreadProc(LPVOID pThis);
+
+    // -----------------------------------------------------------------------
+    // Async hash thread
+    //
+    // LockRect + FNV1a hash + hashDB lookup are moved off the render thread so
+    // it never stalls waiting for hash computation of world/streaming textures.
+    //
+    // Flow:
+    //   QueueHashJob  — render thread pushes first-seen textures (AddRef'd)
+    //   HashThreadProc — does GetLevelDesc, LockRect, hash, UnlockRect, hashDB lookup
+    //   ConsumeHashResults — render thread (exclusive lock): GPU upload for matches,
+    //                        checkedTextures for misses, Release of AddRef'd refs
+    //
+    // Pointer recycling: each job carries a unique jobId.  If InvalidateTexture fires
+    // before a result is consumed, the jobId in pendingJobId_ is erased so the stale
+    // result is discarded when it arrives.
+    //
+    // Lock ordering: SRWLock(exclusive) -> hashMtx_.  The hash thread NEVER
+    // acquires the SRWLock so this ordering is never reversed.
+    // -----------------------------------------------------------------------
+    struct HashJob {
+        IDirect3DBaseTexture9* pTex;   // AddRef'd by QueueHashJob
+        uint64_t               jobId;
+    };
+    struct HashResult {
+        IDirect3DBaseTexture9* pTex;   // still AddRef'd; ConsumeHashResults releases
+        uint64_t               jobId;
+        bool                   match;
+        std::string            texName; // valid iff match
+        uint64_t               hash;
+        D3DFORMAT              fmt;
+        UINT                   w, h;
+    };
+
+    std::mutex                                              hashMtx_;
+    std::deque<HashJob>                                     hashJobs_;
+    std::deque<HashResult>                                  hashResults_;
+    // pTex -> jobId for textures currently in the hash pipeline.
+    // Written/read exclusively under SRWLock exclusive; never touched by hash thread.
+    std::unordered_map<IDirect3DBaseTexture9*, uint64_t>    pendingJobId_;
+    uint64_t                                                nextJobId_ = 0;
+    // pTex -> texName for textures that matched hashDB but whose lazy DDS data is
+    // still being read by the preload thread. These pointers are AddRef'd.
+    std::unordered_map<IDirect3DBaseTexture9*, std::string> preloadWaiting_;
+    HANDLE                                                  hashThread_    = nullptr;
+    HANDLE                                                  hashSemaphore_ = nullptr;
+    std::atomic<bool>                                       hashStop_      { false };
+
+    void StartHashThread();
+    void StopHashThread();
+    void QueueHashJob(IDirect3DBaseTexture9* pTex);        // under SRWLock exclusive
+    void ConsumeHashResults(IDirect3DDevice9* pDevice);    // under SRWLock exclusive
+    static DWORD WINAPI HashThreadProc(LPVOID pThis);
+
+#ifdef HDTEX_HOT_RELOAD
+    // Snapshot of path → last-write-time for every file and subdir under hd_textures\.
+    // HotReload() compares against this to skip the expensive reload when nothing changed.
+    std::unordered_map<std::wstring, FILETIME> m_diskMtimes;
+#endif
+
+    // -----------------------------------------------------------------------
     // Namespace classification helpers
     // -----------------------------------------------------------------------
 
@@ -184,6 +303,15 @@ private:
     void RescanDisk();
     void LoadLazyConfig();
     bool LoadHashDB();
+
+#ifdef HDTEX_HOT_RELOAD
+    // Record modification times of all files and subdirs under hd_textures\
+    // so the next HotReload() cycle can detect whether anything actually changed.
+    void RecordDiskMtimes();
+    // Returns true if any recorded path has been modified, added, or removed since
+    // the last RecordDiskMtimes() call.
+    bool HasDiskChanges() const;
+#endif
 
     static uint64_t FNV1a64(const uint8_t* data, size_t len,
                              uint64_t h = 14695981039346656037ULL);
@@ -381,6 +509,19 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
 
     if (!hdData.empty())
         spdlog::info("HDTextures: {} HD texture(s) available for replacement", hdData.size());
+
+    // Start background preload thread for lazy-loaded namespaces.
+    if (!lazyPrefixes.empty())
+        StartPreloadThread();
+
+    // Start background hash thread.  Every first-seen texture is hashed off the
+    // render thread, eliminating LockRect/FNV1a stalls during world streaming.
+    if (!hashDB.empty())
+        StartHashThread();
+
+#ifdef HDTEX_HOT_RELOAD
+    RecordDiskMtimes();
+#endif
 }
 
 
@@ -498,11 +639,108 @@ inline void HDTextureReplacer::RescanDisk()
 
 #ifdef HDTEX_HOT_RELOAD
 // -----------------------------------------------------------------------
+// RecordDiskMtimes — snapshot last-write times of every .dds file, every
+// subdirectory, and the two config files under hd_textures\. Subdir mtimes
+// change when files are added or removed; individual file mtimes change on
+// edit. Called after Init() and after each successful HotReload() so the
+// next cycle has a baseline to compare against.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::RecordDiskMtimes()
+{
+    m_diskMtimes.clear();
+
+    // Stat a single path and store its write time
+    WIN32_FILE_ATTRIBUTE_DATA attrData;
+    std::wstring hashDBPath   = m_hdRoot + L"\\hash_database.txt";
+    std::wstring lazyCfgPath  = m_hdRoot + L"\\lazyload_config.txt";
+    if (GetFileAttributesExW(hashDBPath.c_str(),  GetFileExInfoStandard, &attrData))
+        m_diskMtimes[hashDBPath]  = attrData.ftLastWriteTime;
+    if (GetFileAttributesExW(lazyCfgPath.c_str(), GetFileExInfoStandard, &attrData))
+        m_diskMtimes[lazyCfgPath] = attrData.ftLastWriteTime;
+
+    // Walk immediate subdirectories of hd_textures/
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW((m_hdRoot + L"\\*").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+        std::wstring subDir = m_hdRoot + L"\\" + fd.cFileName;
+        // Use GetFileAttributesExW directly on each path — same API as HasDiskChanges()
+        // uses for comparison, ensuring we never get a false mismatch from NTFS parent-
+        // directory-entry vs MFT-record timestamp skew.
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(subDir.c_str(), GetFileExInfoStandard, &fa))
+            m_diskMtimes[subDir] = fa.ftLastWriteTime;
+
+        // Individual .dds file mtimes catch in-place edits of existing files
+        WIN32_FIND_DATAW ffd;
+        HANDLE hSub = FindFirstFileW((subDir + L"\\*.dds").c_str(), &ffd);
+        if (hSub == INVALID_HANDLE_VALUE) continue;
+        do
+        {
+            if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring filePath = subDir + L"\\" + ffd.cFileName;
+            if (GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fa))
+                m_diskMtimes[filePath] = fa.ftLastWriteTime;
+        } while (FindNextFileW(hSub, &ffd));
+        FindClose(hSub);
+
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
+// -----------------------------------------------------------------------
+// HasDiskChanges — returns true if any recorded path was modified, deleted,
+// or if a new subdirectory appeared under hd_textures\ since the last
+// RecordDiskMtimes() call. If false, HotReload() skips the expensive reload.
+// -----------------------------------------------------------------------
+inline bool HDTextureReplacer::HasDiskChanges() const
+{
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    for (auto& [path, recorded] : m_diskMtimes)
+    {
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info))
+            return true; // file or subdir was deleted
+        FILETIME cur = info.ftLastWriteTime;
+        if (cur.dwLowDateTime  != recorded.dwLowDateTime ||
+            cur.dwHighDateTime != recorded.dwHighDateTime)
+            return true; // file modified or subdir contents changed
+    }
+
+    // Also detect new subdirectories that weren't present at last record time
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW((m_hdRoot + L"\\*").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    bool newDir = false;
+    do
+    {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::wstring subDir = m_hdRoot + L"\\" + fd.cFileName;
+        if (m_diskMtimes.find(subDir) == m_diskMtimes.end()) { newDir = true; break; }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    return newDir;
+}
+
+// -----------------------------------------------------------------------
 // HotReload — flush all caches and pixel data, then re-read DDS files from disk.
 // Called under g_hdTexCS by the hot-reload background thread.
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::HotReload()
 {
+    // Skip the expensive reload if nothing on disk has changed since last cycle.
+    // This is the common case — only pay the cost when a file is actually edited.
+    if (!HasDiskChanges())
+    {
+        spdlog::trace("HDTextures: hot reload — no disk changes detected, skipping");
+        return;
+    }
+
     // Release all GPU-side HD textures (nameToHDTex is sole owner).
     for (auto& [name, tex] : nameToHDTex)
         if (tex) tex->Release();
@@ -528,6 +766,7 @@ inline void HDTextureReplacer::HotReload()
     LoadHashDB();
     RescanDisk();
 
+    RecordDiskMtimes();
     spdlog::info("HDTextures: hot reload complete ({} hash(es), {} static texture(s) resident)",
                  hashDB.size(), hdData.size());
 }
@@ -535,14 +774,511 @@ inline void HDTextureReplacer::HotReload()
 
 
 // -----------------------------------------------------------------------
-// OnSetTexture — identify texture by hash, swap if HD replacement available
+// Async hash thread — lifecycle
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::StartHashThread()
+{
+    if (hashThread_) return;
+    hashStop_.store(false);
+    hashSemaphore_ = CreateSemaphoreW(nullptr, 0, LONG_MAX, nullptr);
+    if (!hashSemaphore_) {
+        spdlog::error("HDTextures: hash semaphore creation failed");
+        return;
+    }
+    hashThread_ = CreateThread(nullptr, 0, HashThreadProc, this, 0, nullptr);
+    if (!hashThread_) {
+        spdlog::error("HDTextures: hash thread creation failed");
+        CloseHandle(hashSemaphore_);
+        hashSemaphore_ = nullptr;
+    } else {
+        spdlog::info("HDTextures: async hash thread started");
+    }
+}
+
+inline void HDTextureReplacer::StopHashThread()
+{
+    if (!hashThread_) return;
+    hashStop_.store(true);
+    if (hashSemaphore_) ReleaseSemaphore(hashSemaphore_, 1, nullptr); // wake thread
+    WaitForSingleObject(hashThread_, 3000);
+    CloseHandle(hashThread_);  hashThread_    = nullptr;
+    if (hashSemaphore_) { CloseHandle(hashSemaphore_); hashSemaphore_ = nullptr; }
+}
+
+// -----------------------------------------------------------------------
+// HashThreadProc — background worker: LockRect + FNV1a + hashDB lookup.
+// Runs without any application-level lock; only acquires hashMtx_ briefly
+// to pop a job and to push a result.
+// -----------------------------------------------------------------------
+inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
+{
+    HDTextureReplacer* self = static_cast<HDTextureReplacer*>(pThis);
+    while (true)
+    {
+        WaitForSingleObject(self->hashSemaphore_, INFINITE);
+        if (self->hashStop_.load()) break;
+
+        // Pop one job.
+        HashJob job;
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            if (self->hashJobs_.empty()) continue;
+            job = std::move(self->hashJobs_.front());
+            self->hashJobs_.pop_front();
+        }
+
+        // Build a default miss result.
+        HashResult res;
+        res.pTex  = job.pTex;
+        res.jobId = job.jobId;
+        res.match = false;
+        res.hash  = 0;
+        res.fmt   = D3DFMT_UNKNOWN;
+        res.w = res.h = 0;
+
+        // Must be a plain 2D texture.
+        if (job.pTex->GetType() != D3DRTYPE_TEXTURE)
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+            continue;
+        }
+
+        IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(job.pTex);
+        D3DSURFACE_DESC desc;
+        if (FAILED(tex->GetLevelDesc(0, &desc)))
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+            continue;
+        }
+
+        UINT rowPitch = ComputeRowPitch(desc.Format, desc.Width);
+        UINT rowCount = ComputeRowCount(desc.Format, desc.Height);
+        res.fmt = desc.Format;
+        res.w   = desc.Width;
+        res.h   = desc.Height;
+
+        if (!rowPitch || !rowCount)
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+            continue;
+        }
+
+        // LockRect — no application lock held.  D3DCREATE_MULTITHREADED serialises
+        // this internally; the call itself is fast for CPU-resident textures.
+        D3DLOCKED_RECT locked;
+        if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
+        {
+            // Non-lockable texture (DEFAULT pool, not DYNAMIC) — permanent miss.
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+            continue;
+        }
+
+        uint64_t h = 14695981039346656037ULL;
+        const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
+        for (UINT row = 0; row < rowCount; row++)
+            h = FNV1a64(bits + row * locked.Pitch, rowPitch, h);
+        tex->UnlockRect(0);
+
+        res.hash = h;
+
+        // hashDB is populated in Init() and never modified during normal operation.
+        // (During hot-reload it is rebuilt under SRWLock exclusive, which cannot run
+        // concurrently with this thread — the worst case is a stale lookup in the
+        // dev-only hot-reload build, which is benign.)
+        auto dbIt = self->hashDB.find(h);
+        if (dbIt != self->hashDB.end())
+        {
+            res.match   = true;
+            res.texName = dbIt->second;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+        }
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------
+// QueueHashJob — AddRef pTex and push it for background hashing.
+// Must be called under SRWLock exclusive.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::QueueHashJob(IDirect3DBaseTexture9* pTex)
+{
+    if (!hashSemaphore_) return;
+    if (pendingJobId_.count(pTex)) return; // already queued
+
+    uint64_t id = nextJobId_++;
+    pendingJobId_[pTex] = id;
+    pTex->AddRef();
+
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        hashJobs_.push_back({pTex, id});
+    }
+    ReleaseSemaphore(hashSemaphore_, 1, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// ConsumeHashResults — process completed hash results on the render thread.
+//   - matches: look up / create HD texture, populate textureMap
+//   - misses:  add to checkedTextures
+//   - lazy-tile matches whose preload isn't ready yet: park in preloadWaiting_
+// Must be called under SRWLock exclusive.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
+{
+    // 1. Check preload-waiting entries — promote those whose DDS data has arrived.
+    if (!preloadWaiting_.empty())
+    {
+        struct ReadyEntry {
+            IDirect3DBaseTexture9* pTex;
+            std::string            texName;
+            HDTextureData          data;
+        };
+        std::vector<ReadyEntry> ready;
+
+        {
+            std::lock_guard<std::mutex> plk(preloadMtx_);
+            for (auto& [pTex, texName] : preloadWaiting_)
+            {
+                auto readyIt = preloadReady_.find(texName);
+                if (readyIt == preloadReady_.end()) continue;
+                ready.push_back({pTex, texName, std::move(readyIt->second)});
+                preloadReady_.erase(readyIt);
+                preloadQueued_.erase(texName);
+            }
+        }
+
+        for (auto& re : ready)
+        {
+            hdData[re.texName] = std::move(re.data);
+            IDirect3DTexture9* hdTex = CreateHDTexture(pDevice, re.texName);
+            if (hdTex)
+            {
+                nameToHDTex[re.texName] = hdTex;
+                textureMap[re.pTex]     = hdTex;
+                pointerKey[re.pTex]     = re.texName;
+                spdlog::info("HDTextures: MATCH(preload-ready) '{}' -> {}x{}",
+                             re.texName, hdData.at(re.texName).hdW, hdData.at(re.texName).hdH);
+            }
+            else
+            {
+                checkedTextures.insert(re.pTex);
+            }
+            re.pTex->Release();
+            preloadWaiting_.erase(re.pTex);
+        }
+    }
+
+    // 2. Steal the hash results queue (brief lock).
+    std::deque<HashResult> batch;
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        if (hashResults_.empty()) return;
+        batch.swap(hashResults_);
+    }
+
+    for (auto& r : batch)
+    {
+        // Validate: if the pointer was invalidated (or re-queued) since this job was
+        // pushed, the jobId will be absent or mismatched — discard the stale result.
+        auto jobIt = pendingJobId_.find(r.pTex);
+        if (jobIt == pendingJobId_.end() || jobIt->second != r.jobId)
+        {
+            r.pTex->Release();
+            continue;
+        }
+        pendingJobId_.erase(jobIt);
+
+        if (!r.match)
+        {
+            spdlog::info("HDTextures: MISS {:016x} {}x{} fmt={:x}",
+                         r.hash, r.w, r.h, (DWORD)r.fmt);
+            checkedTextures.insert(r.pTex);
+            r.pTex->Release();
+            continue;
+        }
+
+        const std::string& texName = r.texName;
+        std::string numberedPrefix;
+
+        if (IsNumberedTile(texName))
+        {
+            const std::string ns = texName.substr(0, texName.find('/'));
+            auto [pfx, num] = SplitNumberedNamespace(ns);
+            numberedPrefix = pfx;
+
+            auto& group = numberedGroups[pfx];
+            if (group.lruCap == 0)
+                group.lruCap = LruCapForPrefix(pfx);
+
+            if (!group.currentNumber.empty() && group.currentNumber != num)
+            {
+                spdlog::debug("HDTextures: numbered group switching '{}{}' -> '{}{}'",
+                              pfx, group.currentNumber, pfx, num);
+                FlushGroup(pfx, group);
+                QueueNamespacePreload(pfx, num);
+            }
+            group.currentNumber = num;
+        }
+
+        // Already resident in VRAM?  Reuse and fast-path cache.
+        auto nameIt = nameToHDTex.find(texName);
+        if (nameIt != nameToHDTex.end())
+        {
+            if (!numberedPrefix.empty())
+            {
+                auto& group = numberedGroups[numberedPrefix];
+                auto lruIt  = group.lruIndex.find(texName);
+                if (lruIt != group.lruIndex.end())
+                {
+                    group.lruOrder.erase(lruIt->second);
+                    group.lruOrder.push_front(texName);
+                    group.lruIndex[texName] = group.lruOrder.begin();
+                }
+            }
+            textureMap[r.pTex] = nameIt->second;
+            pointerKey[r.pTex] = texName;
+            r.pTex->Release();
+            continue;
+        }
+
+        // Check preload thread for lazy-loaded tile data.
+        if (!numberedPrefix.empty() && hdData.find(texName) == hdData.end())
+        {
+            auto pathIt = lazyPaths.find(texName);
+            if (pathIt != lazyPaths.end())
+            {
+                std::lock_guard<std::mutex> plk(preloadMtx_);
+                auto readyIt = preloadReady_.find(texName);
+                if (readyIt != preloadReady_.end())
+                {
+                    // Data ready — move into hdData and continue to GPU upload.
+                    spdlog::debug("HDTextures: preload hit '{}' ({}x{})",
+                                  texName, readyIt->second.hdW, readyIt->second.hdH);
+                    hdData[texName] = std::move(readyIt->second);
+                    preloadReady_.erase(readyIt);
+                    preloadQueued_.erase(texName);
+                }
+                else
+                {
+                    // Still loading — queue preload if not already in flight and
+                    // park the pointer in preloadWaiting_ (keeps AddRef alive).
+                    if (!preloadQueued_.count(texName))
+                    {
+                        preloadQueued_.insert(texName);
+                        preloadJobs_.push_back({texName, pathIt->second});
+                        if (preloadSemaphore_)
+                            ReleaseSemaphore(preloadSemaphore_, 1, nullptr);
+                    }
+                    preloadWaiting_[r.pTex] = texName; // ref stays alive
+                    continue; // do NOT Release — preloadWaiting_ owns the ref
+                }
+            }
+        }
+
+        // GPU upload.
+        IDirect3DTexture9* hdTex = CreateHDTexture(pDevice, texName);
+        if (!hdTex)
+        {
+            checkedTextures.insert(r.pTex);
+            r.pTex->Release();
+            continue;
+        }
+
+        nameToHDTex[texName] = hdTex;
+        textureMap[r.pTex]   = hdTex;
+        pointerKey[r.pTex]   = texName;
+
+        if (!numberedPrefix.empty())
+        {
+            auto& group = numberedGroups[numberedPrefix];
+            group.lruOrder.push_front(texName);
+            group.lruIndex[texName] = group.lruOrder.begin();
+            while (group.lruOrder.size() > group.lruCap)
+                EvictOldest(numberedPrefix, group);
+        }
+
+        spdlog::info("HDTextures: MATCH '{}' {:016x} {}x{} -> {}x{}",
+                     texName, r.hash, r.w, r.h,
+                     hdData.at(texName).hdW, hdData.at(texName).hdH);
+
+        r.pTex->Release();
+    }
+}
+
+
+// -----------------------------------------------------------------------
+// Async preload — thread lifecycle
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::StartPreloadThread()
+{
+    if (preloadThread_) return;
+    preloadStop_.store(false);
+    preloadSemaphore_ = CreateSemaphoreW(nullptr, 0, LONG_MAX, nullptr);
+    if (!preloadSemaphore_) {
+        spdlog::error("HDTextures: preload semaphore creation failed");
+        return;
+    }
+    preloadThread_ = CreateThread(nullptr, 0, PreloadThreadProc, this, 0, nullptr);
+    if (!preloadThread_) {
+        spdlog::error("HDTextures: preload thread creation failed");
+        CloseHandle(preloadSemaphore_);
+        preloadSemaphore_ = nullptr;
+    } else {
+        spdlog::info("HDTextures: tile preload thread started");
+    }
+}
+
+inline void HDTextureReplacer::StopPreloadThread()
+{
+    if (!preloadThread_) return;
+    preloadStop_.store(true);
+    if (preloadSemaphore_) ReleaseSemaphore(preloadSemaphore_, 1, nullptr); // wake thread
+    WaitForSingleObject(preloadThread_, 3000);
+    CloseHandle(preloadThread_);  preloadThread_    = nullptr;
+    if (preloadSemaphore_) { CloseHandle(preloadSemaphore_); preloadSemaphore_ = nullptr; }
+}
+
+inline DWORD WINAPI HDTextureReplacer::PreloadThreadProc(LPVOID pThis)
+{
+    HDTextureReplacer* self = static_cast<HDTextureReplacer*>(pThis);
+    while (true)
+    {
+        WaitForSingleObject(self->preloadSemaphore_, INFINITE);
+        if (self->preloadStop_.load()) break;
+
+        // Pop one job (brief lock).
+        PreloadJob job;
+        {
+            std::lock_guard<std::mutex> lk(self->preloadMtx_);
+            if (self->preloadJobs_.empty()) continue;
+            job = std::move(self->preloadJobs_.front());
+            self->preloadJobs_.pop_front();
+        }
+
+        // Read the DDS file with no lock held — this is the whole point.
+        UINT hdW, hdH;
+        D3DFORMAT fmt;
+        std::vector<uint8_t> pixels;
+        if (ReadDDS(job.filePath, hdW, hdH, fmt, pixels))
+        {
+            HDTextureData hd;
+            hd.hdW = hdW; hd.hdH = hdH;
+            hd.format = fmt;
+            hd.pixelData = std::move(pixels);
+
+            std::lock_guard<std::mutex> lk(self->preloadMtx_);
+            self->preloadReady_[job.texName] = std::move(hd);
+            spdlog::debug("HDTextures: preloaded '{}'", job.texName);
+        }
+        else
+        {
+            // File missing / unreadable — remove from queued so the render
+            // thread doesn't wait forever. Will fall through to original texture.
+            std::lock_guard<std::mutex> lk(self->preloadMtx_);
+            self->preloadQueued_.erase(job.texName);
+            spdlog::warn("HDTextures: preload failed for '{}'", job.texName);
+        }
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------
+// QueueTilePreload — enqueue one tile if not already queued or loaded.
+// Called under SRWLock exclusive.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::QueueTilePreload(const std::string& texName,
+                                                const std::wstring& path)
+{
+    if (!preloadSemaphore_) return;
+    std::lock_guard<std::mutex> lk(preloadMtx_);
+    if (preloadQueued_.count(texName)) return;
+    preloadQueued_.insert(texName);
+    preloadJobs_.push_back({texName, path});
+    ReleaseSemaphore(preloadSemaphore_, 1, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// QueueNamespacePreload — enqueue every unloaded tile for a namespace.
+// Called when a namespace switch is detected, giving the background thread
+// a head-start before the game starts binding those textures.
+// Called under SRWLock exclusive (lazyPaths / hdData are safe to read).
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::QueueNamespacePreload(const std::string& prefix,
+                                                     const std::string& number)
+{
+    if (!preloadSemaphore_) return;
+    const std::string nsKey = prefix + number + "/";
+    LONG count = 0;
+    {
+        std::lock_guard<std::mutex> lk(preloadMtx_);
+        for (auto& [key, path] : lazyPaths)
+        {
+            if (key.size() >= nsKey.size() &&
+                key.compare(0, nsKey.size(), nsKey) == 0 &&
+                !preloadQueued_.count(key) &&
+                hdData.find(key) == hdData.end())
+            {
+                preloadQueued_.insert(key);
+                preloadJobs_.push_back({key, path});
+                ++count;
+            }
+        }
+    }
+    if (count > 0)
+    {
+        ReleaseSemaphore(preloadSemaphore_, count, nullptr);
+        spdlog::info("HDTextures: queued {} tile(s) for async preload ('{}{}')",
+                     count, prefix, number);
+    }
+}
+
+
+// -----------------------------------------------------------------------
+// TryFastPath — shared-lock read-only cache check, no disk I/O or D3D calls.
+// Returns the texture to bind if already resolved, nullptr on cache miss.
+// -----------------------------------------------------------------------
+inline IDirect3DBaseTexture9* HDTextureReplacer::TryFastPath(IDirect3DBaseTexture9* pTexture)
+{
+    if (!pTexture || hashDB.empty()) return pTexture;
+
+    auto mapIt = textureMap.find(pTexture);
+    if (mapIt != textureMap.end()) return mapIt->second;
+
+    if (checkedTextures.count(pTexture)) return pTexture;
+
+    // Already queued for hashing or waiting for lazy preload data — use original this frame.
+    if (pendingJobId_.count(pTexture))   return pTexture;
+    if (preloadWaiting_.count(pTexture)) return pTexture;
+
+    return nullptr; // true cache miss — caller must escalate to exclusive lock
+}
+
+
+// -----------------------------------------------------------------------
+// OnSetTexture — identify texture by hash, swap if HD replacement available.
+//
+// Hashing is now fully async: every first-seen texture is pushed to the
+// background hash thread.  This function only processes completed results
+// and queues new work; it never blocks on LockRect or hash computation.
 // -----------------------------------------------------------------------
 inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* pDevice,
                                                               IDirect3DBaseTexture9* pTexture)
 {
     if (!pTexture || hashDB.empty()) return pTexture;
 
-    // Fast path: already mapped to an HD texture.
+    // Drain any results the hash thread (or preload thread) has completed.
+    // This may populate textureMap / checkedTextures for textures seen earlier.
+    ConsumeHashResults(pDevice);
+
+    // Fast path: already mapped to an HD texture (may have just been populated above).
     auto mapIt = textureMap.find(pTexture);
     if (mapIt != textureMap.end())
         return mapIt->second;
@@ -551,137 +1287,13 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
     if (checkedTextures.count(pTexture))
         return pTexture;
 
-    checkedTextures.insert(pTexture);
-
-    if (pTexture->GetType() != D3DRTYPE_TEXTURE)
+    // Already in hash pipeline or waiting for lazy-tile preload data.
+    if (pendingJobId_.count(pTexture) || preloadWaiting_.count(pTexture))
         return pTexture;
 
-    IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(pTexture);
-
-    D3DSURFACE_DESC desc;
-    if (FAILED(tex->GetLevelDesc(0, &desc)))
-        return pTexture;
-
-    UINT rowPitch = ComputeRowPitch(desc.Format, desc.Width);
-    UINT rowCount = ComputeRowCount(desc.Format, desc.Height);
-    if (rowPitch == 0 || rowCount == 0)
-        return pTexture;
-
-    D3DLOCKED_RECT locked;
-    if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
-        return pTexture;
-
-    uint64_t h = 14695981039346656037ULL;
-    const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
-    for (UINT row = 0; row < rowCount; row++)
-        h = FNV1a64(bits + row * locked.Pitch, rowPitch, h);
-
-    tex->UnlockRect(0);
-
-    auto dbIt = hashDB.find(h);
-    if (dbIt == hashDB.end())
-        return pTexture;
-
-    const std::string& texName = dbIt->second;
-
-    // Track the prefix so we can manage the right group, without splitting twice.
-    std::string numberedPrefix;
-
-    if (IsNumberedTile(texName))
-    {
-        const std::string ns = texName.substr(0, texName.find('/'));
-        auto [pfx, num] = SplitNumberedNamespace(ns);
-        numberedPrefix = pfx;
-
-        // Initialise group on first encounter.
-        auto& group = numberedGroups[pfx];
-        if (group.lruCap == 0)
-            group.lruCap = LruCapForPrefix(pfx);
-
-        // Flush the old namespace when the active number changes.
-        if (!group.currentNumber.empty() && group.currentNumber != num)
-        {
-            spdlog::debug("HDTextures: numbered group switching '{}{}' -> '{}{}'",
-                          pfx, group.currentNumber, pfx, num);
-            FlushGroup(pfx, group);
-        }
-        group.currentNumber = num;
-    }
-
-    // Check nameToHDTex for ALL textures — static and numbered alike.
-    // If the HD texture is already resident (e.g. game reloaded at a new address),
-    // reuse it — no disk read, no GPU upload.
-    {
-        auto nameIt = nameToHDTex.find(texName);
-        if (nameIt != nameToHDTex.end())
-        {
-            // Touch LRU for numbered tiles.
-            if (!numberedPrefix.empty())
-            {
-                auto& group = numberedGroups[numberedPrefix];
-                auto lruIt = group.lruIndex.find(texName);
-                if (lruIt != group.lruIndex.end())
-                {
-                    group.lruOrder.erase(lruIt->second);
-                    group.lruOrder.push_front(texName);
-                    group.lruIndex[texName] = group.lruOrder.begin();
-                }
-            }
-
-            textureMap[pTexture] = nameIt->second;   // non-owning fast-path
-            pointerKey[pTexture] = texName;
-            return nameIt->second;
-        }
-    }
-
-    // Not yet resident: lazy-load pixel data from disk for lazy-loaded numbered namespaces.
-    // Preloaded namespaces (shops) and static namespaces already have data in hdData.
-    if (!numberedPrefix.empty() && hdData.find(texName) == hdData.end())
-    {
-        auto pathIt = lazyPaths.find(texName);
-        if (pathIt != lazyPaths.end())
-        {
-            UINT hdW, hdH;
-            D3DFORMAT format;
-            std::vector<uint8_t> pixels;
-            if (ReadDDS(pathIt->second, hdW, hdH, format, pixels))
-            {
-                HDTextureData hd;
-                hd.hdW = hdW; hd.hdH = hdH;
-                hd.format = format;
-                hd.pixelData = std::move(pixels);
-                spdlog::debug("HDTextures: lazy-loaded map tile '{}' ({}x{})",
-                              texName, hdW, hdH);
-                hdData[texName] = std::move(hd);
-            }
-        }
-    }
-
-    IDirect3DTexture9* hdTex = CreateHDTexture(pDevice, texName);
-    if (!hdTex)
-        return pTexture;
-
-    // nameToHDTex owns ALL HD textures — static and numbered alike.
-    nameToHDTex[texName] = hdTex;
-    textureMap[pTexture]  = hdTex;   // non-owning fast-path
-    pointerKey[pTexture]  = texName;
-
-    // Numbered tiles: register in group LRU and evict if over cap.
-    if (!numberedPrefix.empty())
-    {
-        auto& group = numberedGroups[numberedPrefix];
-        group.lruOrder.push_front(texName);
-        group.lruIndex[texName] = group.lruOrder.begin();
-
-        while (group.lruOrder.size() > group.lruCap)
-            EvictOldest(numberedPrefix, group);
-    }
-
-    spdlog::debug("HDTextures: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
-                  texName, h, desc.Width, desc.Height,
-                  hdData.at(texName).hdW, hdData.at(texName).hdH);
-
-    return hdTex;
+    // New texture — queue for background hashing.
+    QueueHashJob(pTexture);
+    return pTexture;
 }
 
 
@@ -714,6 +1326,28 @@ inline void HDTextureReplacer::ReleaseTextures()
     // Preloaded pixel data (shops, gui_resident) is kept — it came from Init().
     for (auto it = hdData.begin(); it != hdData.end(); )
         it = lazyPaths.count(it->first) ? hdData.erase(it) : std::next(it);
+
+    // Flush preload queues — discard in-flight reads whose pixel data
+    // would be stale after the device reset clears all GPU textures.
+    {
+        std::lock_guard<std::mutex> lk(preloadMtx_);
+        preloadJobs_.clear();
+        preloadQueued_.clear();
+        preloadReady_.clear();
+    }
+
+    // Flush hash queues — release all AddRef'd textures in the pipeline.
+    // Any result that arrives after this is discarded (pendingJobId_ is cleared).
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        for (auto& job : hashJobs_)  job.pTex->Release();
+        hashJobs_.clear();
+        for (auto& res : hashResults_) res.pTex->Release();
+        hashResults_.clear();
+    }
+    for (auto& [pTex, texName] : preloadWaiting_) pTex->Release();
+    preloadWaiting_.clear();
+    pendingJobId_.clear();
 }
 
 
@@ -727,6 +1361,18 @@ inline void HDTextureReplacer::InvalidateTexture(IDirect3DBaseTexture9* pTexture
     textureMap.erase(pTexture);
     checkedTextures.erase(pTexture);
     pointerKey.erase(pTexture);
+
+    // Clear hash-pipeline entry.  When the in-flight result arrives, the missing
+    // (or mismatched) jobId causes it to be discarded without touching any cache.
+    pendingJobId_.erase(pTexture);
+
+    // Release preload-waiting reference.
+    auto waitIt = preloadWaiting_.find(pTexture);
+    if (waitIt != preloadWaiting_.end())
+    {
+        pTexture->Release();
+        preloadWaiting_.erase(waitIt);
+    }
 }
 
 
@@ -838,36 +1484,77 @@ inline IDirect3DTexture9* HDTextureReplacer::CreateHDTexture(IDirect3DDevice9* p
     if (hdIt == hdData.end()) return nullptr;
     const HDTextureData& hd = hdIt->second;
 
+    spdlog::debug("HDTextures: CreateTexture '{}' {}x{} fmt=0x{:X}",
+                  texName, hd.hdW, hd.hdH, (unsigned)hd.format);
+
+    // Helper: fill a lockable texture (MANAGED or SYSTEMMEM) with our pixel data.
+    auto FillLockable = [&](IDirect3DTexture9* tex) -> bool {
+        D3DLOCKED_RECT locked;
+        HRESULT hr2 = tex->LockRect(0, &locked, nullptr, 0);
+        if (FAILED(hr2)) {
+            spdlog::error("HDTextures: failed to lock texture for '{}' (hr=0x{:08X})", texName, (unsigned)hr2);
+            return false;
+        }
+        UINT rowPitch = ComputeRowPitch(hd.format, hd.hdW);
+        UINT rowCount = ComputeRowCount(hd.format, hd.hdH);
+        const uint8_t* src = hd.pixelData.data();
+        for (UINT row = 0; row < rowCount; row++)
+            memcpy(static_cast<uint8_t*>(locked.pBits) + row * locked.Pitch,
+                   src + row * rowPitch, rowPitch);
+        tex->UnlockRect(0);
+        return true;
+    };
+
     IDirect3DTexture9* hdTex = nullptr;
     HRESULT hr = pDevice->CreateTexture(hd.hdW, hd.hdH, 1, 0,
                                         hd.format, D3DPOOL_MANAGED,
                                         &hdTex, nullptr);
-    if (FAILED(hr))
+    if (SUCCEEDED(hr))
     {
-        spdlog::error("HDTextures: failed to create HD texture for '{}' (hr=0x{:08X})",
-                      texName, (unsigned)hr);
-        return nullptr;
+        // D3D9 (non-Ex) path: managed pool, lock and fill directly.
+        if (!FillLockable(hdTex)) { hdTex->Release(); return nullptr; }
+        return hdTex;
     }
 
-    D3DLOCKED_RECT hdLocked;
-    hr = hdTex->LockRect(0, &hdLocked, nullptr, 0);
-    if (FAILED(hr))
+    if (hr == D3DERR_INVALIDCALL)
     {
-        spdlog::error("HDTextures: failed to lock HD texture for '{}' (hr=0x{:08X})",
-                      texName, (unsigned)hr);
-        hdTex->Release();
-        return nullptr;
+        // D3D9Ex path: managed pool is not supported. Upload via a SYSTEMMEM
+        // staging texture copied into a DEFAULT pool texture with UpdateTexture.
+        spdlog::info("HDTextures: D3DPOOL_MANAGED rejected for '{}' — using SYSTEMMEM staging (D3D9Ex device)",
+                     texName);
+
+        IDirect3DTexture9* staging = nullptr;
+        hr = pDevice->CreateTexture(hd.hdW, hd.hdH, 1, 0,
+                                    hd.format, D3DPOOL_SYSTEMMEM,
+                                    &staging, nullptr);
+        if (FAILED(hr)) {
+            spdlog::error("HDTextures: failed to create staging texture for '{}' (hr=0x{:08X})", texName, (unsigned)hr);
+            return nullptr;
+        }
+        if (!FillLockable(staging)) { staging->Release(); return nullptr; }
+
+        hr = pDevice->CreateTexture(hd.hdW, hd.hdH, 1, 0,
+                                    hd.format, D3DPOOL_DEFAULT,
+                                    &hdTex, nullptr);
+        if (FAILED(hr)) {
+            spdlog::error("HDTextures: failed to create DEFAULT texture for '{}' (hr=0x{:08X})", texName, (unsigned)hr);
+            staging->Release();
+            return nullptr;
+        }
+
+        hr = pDevice->UpdateTexture(staging, hdTex);
+        staging->Release();
+        if (FAILED(hr)) {
+            spdlog::error("HDTextures: UpdateTexture failed for '{}' (hr=0x{:08X})", texName, (unsigned)hr);
+            hdTex->Release();
+            return nullptr;
+        }
+        return hdTex;
     }
 
-    UINT hdRowPitch = ComputeRowPitch(hd.format, hd.hdW);
-    UINT hdRowCount = ComputeRowCount(hd.format, hd.hdH);
-    const uint8_t* src = hd.pixelData.data();
-    for (UINT row = 0; row < hdRowCount; row++)
-        memcpy(static_cast<uint8_t*>(hdLocked.pBits) + row * hdLocked.Pitch,
-               src + row * hdRowPitch, hdRowPitch);
-
-    hdTex->UnlockRect(0);
-    return hdTex;
+    spdlog::error("HDTextures: failed to create HD texture for '{}' {}x{} fmt=0x{:X} (hr=0x{:08X})",
+                  texName, hd.hdW, hd.hdH, (unsigned)hd.format, (unsigned)hr);
+    return nullptr;
 }
 
 
@@ -993,3 +1680,102 @@ inline bool HDTextureReplacer::ReadDDS(const std::wstring& path, UINT& width, UI
 
     return f.gcount() == static_cast<std::streamsize>(dataSize);
 }
+
+#ifdef HDTEX_DUMP_TEXTURES
+// -----------------------------------------------------------------------
+// HDTEX_DUMP_TEXTURES — write every seen texture to textures_dump\<hash>.dds
+// Skips already-dumped hashes (checked via file existence). Never dumps
+// the same hash twice per session even across hot-reloads.
+// -----------------------------------------------------------------------
+inline std::wstring& HDTextureReplacer::TexDumpDir()
+{
+    static std::wstring s_dir;
+    return s_dir;
+}
+
+inline void HDTextureReplacer::SetTexDumpDir(const std::wstring& dir)
+{
+    TexDumpDir() = dir;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    spdlog::info("HDTextures: texture dump enabled -> textures_dump\\");
+}
+
+inline void HDTextureReplacer::DumpTextureDDS(uint64_t hash, D3DFORMAT fmt,
+                                              UINT w, UINT h,
+                                              const void* pBits, UINT pitch,
+                                              UINT rowPitch, UINT rowCount)
+{
+    const std::wstring& dir = TexDumpDir();
+    if (dir.empty()) return;
+
+    wchar_t fname[32];
+    swprintf_s(fname, L"%016llx.dds", static_cast<unsigned long long>(hash));
+    std::wstring path = dir + L"\\" + fname;
+
+    // Skip if already written this session or in a previous one.
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    // Build a minimal 128-byte DDS header.
+    uint8_t hdr[128] = {};
+    memcpy(hdr, "DDS ", 4);
+    *reinterpret_cast<uint32_t*>(hdr +  4) = 124;  // dwSize
+    *reinterpret_cast<uint32_t*>(hdr + 12) = h;
+    *reinterpret_cast<uint32_t*>(hdr + 16) = w;
+    *reinterpret_cast<uint32_t*>(hdr + 76) = 32;   // pfSize
+    *reinterpret_cast<uint32_t*>(hdr +108) = 0x1000; // DDSCAPS_TEXTURE
+
+    bool isBlock = (fmt == D3DFMT_DXT1 || fmt == D3DFMT_DXT3 || fmt == D3DFMT_DXT5);
+
+    if (isBlock)
+    {
+        *reinterpret_cast<uint32_t*>(hdr +  8) = 0x00081007; // CAPS|HEIGHT|WIDTH|PF|LINEARSIZE
+        *reinterpret_cast<uint32_t*>(hdr + 20) = rowPitch * rowCount; // linear size
+        *reinterpret_cast<uint32_t*>(hdr + 80) = 0x4;  // DDPF_FOURCC
+        *reinterpret_cast<uint32_t*>(hdr + 84) = static_cast<uint32_t>(fmt); // DXT fourCC
+    }
+    else
+    {
+        *reinterpret_cast<uint32_t*>(hdr +  8) = 0x0000100F; // CAPS|HEIGHT|WIDTH|PF|PITCH
+        *reinterpret_cast<uint32_t*>(hdr + 20) = rowPitch;   // pitch
+
+        uint32_t pfFlags = 0, bpp = 0, rM = 0, gM = 0, bM = 0, aM = 0;
+        switch (fmt)
+        {
+        case D3DFMT_A8R8G8B8:
+            pfFlags=0x41; bpp=32; rM=0x00FF0000; gM=0x0000FF00; bM=0x000000FF; aM=0xFF000000; break;
+        case D3DFMT_X8R8G8B8:
+            pfFlags=0x40; bpp=32; rM=0x00FF0000; gM=0x0000FF00; bM=0x000000FF; break;
+        case D3DFMT_R5G6B5:
+            pfFlags=0x40; bpp=16; rM=0xF800; gM=0x07E0; bM=0x001F; break;
+        case D3DFMT_A1R5G5B5:
+            pfFlags=0x41; bpp=16; rM=0x7C00; gM=0x03E0; bM=0x001F; aM=0x8000; break;
+        case D3DFMT_A4R4G4B4:
+            pfFlags=0x41; bpp=16; rM=0x0F00; gM=0x00F0; bM=0x000F; aM=0xF000; break;
+        case D3DFMT_L8:
+            pfFlags=0x20000; bpp=8; rM=0xFF; break;    // DDPF_LUMINANCE
+        case D3DFMT_A8:
+            pfFlags=0x2;    bpp=8; aM=0xFF; break;     // DDPF_ALPHA
+        default:
+            // Unknown format: write raw pixel data with no valid pixel format info.
+            // The file will open in tools that do raw inspection; at least it has dims.
+            pfFlags=0; bpp=0; break;
+        }
+        *reinterpret_cast<uint32_t*>(hdr + 80) = pfFlags;
+        *reinterpret_cast<uint32_t*>(hdr + 88) = bpp;
+        *reinterpret_cast<uint32_t*>(hdr + 92) = rM;
+        *reinterpret_cast<uint32_t*>(hdr + 96) = gM;
+        *reinterpret_cast<uint32_t*>(hdr +100) = bM;
+        *reinterpret_cast<uint32_t*>(hdr +104) = aM;
+    }
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return;
+
+    f.write(reinterpret_cast<const char*>(hdr), 128);
+
+    // Write rows, stripping any extra pitch padding from the locked rect.
+    const uint8_t* src = static_cast<const uint8_t*>(pBits);
+    for (UINT row = 0; row < rowCount; ++row)
+        f.write(reinterpret_cast<const char*>(src + row * pitch), rowPitch);
+}
+#endif // HDTEX_DUMP_TEXTURES

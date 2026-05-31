@@ -1,0 +1,21 @@
+# FF13-2 shader replacements
+# Format: one hex hash per line; # starts a comment; 0x prefix optional.
+# Each hash must have a corresponding <hash>.cso in this directory.
+# Remove or rename this file entirely to disable shader replacement.
+
+af31d3405062ee68    # gameplay DoF gather+composite (185 tokens)
+f206fbc4baadd122    # Valhalla fight DoF composite (144 tokens)
+67f7f77335ff7a82    # cutscene DoF — in-game + map cutscenes (240 tokens)
+8b0d63a81922561b    # cutscene near-blur pass (211 tokens)
+060b9a63a30b8f34    # shadow caster — replaced with alpha-aware variant (e3ffdec520d824b2)
+
+# Lit surface alpha fix — purpose of each shader TBD, enable one at a time to identify geometry.
+# ALL fixed to output alpha as tex.a * vert.a, bypassing modulateColor.w multiplication.
+# Source: shader_files/<hash>/<hash>.hlsl — compile with fxc /T ps_3_0 /E main
+b9406b1afa8fee57    # lit: 1 dir light, no shadow, no point  (41 slots)
+4b82d418ba0f5339    # lit: 1 dir + 1 point, no shadow        (58 slots)
+a009375f128d43d6    # lit: 1 dir + 4-cascade shadow          (96 slots)
+a6f4d5a5756cdb25    # lit: 1 dir + 1 point + shadow          (114 slots)
+e02b3853d5a4fc00    # lit: 1 dir + 2 point (loop) + shadow   (130 slots)
+5e4c28d7859bc12a    # lit: 4 lights (bool-gated) + shadow    (319 slots)
+4ee03898b1bf663b    # vfx: vfxVanmMergePercent lerp blend    (8 slots)

@@ -94,6 +94,12 @@ TROUBLESHOOTING
   Game crashes after playing for a while
     See the 4GB patch requirment described earlier in this file.
 
+  Costume artwork does not change when switching outfits
+    The automatic costume detection relies on intercepting file access at the
+    system level. Running the game in a Windows compatibility mode (e.g. Vista
+    or Windows 8) replaces system DLLs with shims that break this mechanism.
+    Do not run the game in compatibility mode.
+
   Conflict with another mod that uses version.dll
     This mod uses version.dll as its injection point. If another mod also
     occupies version.dll, one of them will need to use a different proxy DLL

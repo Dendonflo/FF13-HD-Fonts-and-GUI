@@ -12,6 +12,7 @@
 #include "DoFFixer.h"
 #include "MinHook.h"
 
+
 // Diagnostic-only: log every device method called by the game, so we can
 // identify the last method invoked before a crash. Define HDTEX_TRACE_DEVICE
 // to enable. Each call writes one short line to HDTextures.log.
@@ -55,19 +56,24 @@ public:
             AddRef();
             return S_OK;
         }
-        // For IDirect3DDevice9Ex queries (and any other unrecognized riid),
-        // forward to the real device. The caller (typically d3dx9_43.dll
-        // inside D3DXCreateTexture/etc.) gets the real Ex pointer and uses
-        // it directly. Returning *this for the Ex query causes d3dx9 to
-        // crash deep inside D3DXCreateTexture — likely because d3dx9 takes
-        // shortcuts that assume the device is a stock d3d9.dll-internal
-        // object with a specific vtable layout it can introspect, and our
-        // derived class doesn't match.
+        // HDTEX_PROXY_QI_EX: return the proxy itself for IDirect3DDevice9Ex queries.
+        // Safe for D3D9Ex games (e.g. LR:FFXIII) that use CreateDeviceEx and do NOT
+        // load d3dx9_43.dll. Without this, callers that QI for Ex (e.g. the save icon
+        // loader) receive the real device and their subsequent CreateTexture/SetTexture
+        // calls bypass our proxy entirely, making hash-based replacement impossible.
         //
-        // Trade-off: D3DX-internal calls bypass our HD texture interception.
-        // FF13's GUI textures are loaded via direct device->CreateTexture,
-        // not D3DXCreateTexture, so this path doesn't affect the mod's
-        // primary purpose.
+        // Do NOT define this for FF13-1/FF13-2: those games use CreateDevice (plain
+        // D3D9) and may load d3dx9_43.dll, which raw-casts the device pointer assuming
+        // a stock d3d9.dll vtable layout. Returning our proxy there causes a crash
+        // deep inside D3DXCreateTexture.
+#ifdef HDTEX_PROXY_QI_EX
+        if (riid == __uuidof(IDirect3DDevice9Ex)) {
+            *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
+            AddRef();
+            return S_OK;
+        }
+#endif
+        // For all other unrecognized riid, forward to the real device.
         HRESULT hr = m_pReal->QueryInterface(riid, ppvObj);
 #ifdef HDTEX_TRACE_DEVICE
         spdlog::info("DEV::QueryInterface forwarded -> hr=0x{:08X} ppv={:p}", (unsigned)hr, *ppvObj);
@@ -715,7 +721,11 @@ public:
         DEV_TRACE("CreateDepthStencilSurfaceEx"); return m_pReal->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage);
     }
     HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override {
-        if (m_pTexReplacer) m_pTexReplacer->ReleaseTextures();
+        // D3D9Ex does NOT invalidate D3DPOOL_DEFAULT resources on ResetEx — the device
+        // is resilient by design. Do NOT release HD textures here; they remain valid
+        // across ResetEx. Releasing and re-uploading on every ResetEx call causes
+        // severe stutter (full UpdateTexture GPU stall per texture per cycle).
+        spdlog::info("HDTextures: ResetEx (D3D9Ex resilient reset — HD textures preserved)");
         return m_pReal->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
     }
     HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override {

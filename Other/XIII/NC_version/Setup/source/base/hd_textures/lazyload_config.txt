@@ -1,0 +1,7 @@
+map_scene     128  # Map tiles
+mission       16   # Mission maps
+shop          32   # Shop interfaces
+monster       16   # Monster artwork
+savefiles     256  # Save game icons
+gui_scene     16    # Scene-specific GUI overlays
+summary       2    # Summary screen on loadings

@@ -26,12 +26,17 @@ static HINSTANCE g_hDLL       = nullptr;
 static HDTextureReplacer* g_HDTextures = nullptr;
 static std::unique_ptr<HDTextureReplacer> g_HDTexturesOwner;
 
-// Serialises all HDTextureReplacer calls (OnSetTexture, InvalidateTexture,
-// ReleaseTextures). FF13 creates its device with D3DCREATE_MULTITHREADED so
-// SetTexture and CreateTexture arrive concurrently from multiple threads.
-// Without this lock the unordered_map accesses inside HDTextureReplacer race
-// and corrupt the map state, causing a crash.
-static CRITICAL_SECTION g_hdTexCS;
+// Protects all HDTextureReplacer state. FF13 creates its device with
+// D3DCREATE_MULTITHREADED so SetTexture and CreateTexture arrive concurrently.
+//
+// SRWLock replaces the old CRITICAL_SECTION so that the common case —
+// SetTexture hitting an already-cached texture — can proceed under a shared
+// (read) lock without blocking concurrent callers. Only the slow path
+// (new texture: hash, disk load, GPU upload) and write operations (Reset,
+// InvalidateTexture, costume swap, hot-reload) take the exclusive lock.
+//
+// SRWLOCK_INIT is a compile-time constant; no runtime Init/Delete needed.
+static SRWLOCK g_hdTexSRW = SRWLOCK_INIT;
 
 // Directory containing this DLL (set in DllMain before any hook fires).
 // Used by the costume swap callback to build paths to costume DDS files.
@@ -72,10 +77,10 @@ static void OnCostumeChanged(const char* charPath,
     // texName matches the key in hashDB / hdData, e.g. "gui_resident/face_serah"
     std::string texName = std::string("gui_resident/face_") + texSuffix;
 
-    EnterCriticalSection(&g_hdTexCS);
+    AcquireSRWLockExclusive(&g_hdTexSRW);
     if (g_HDTextures)
         g_HDTextures->SwapCostumeTexture(texName, hdW, hdH, format, std::move(pixels));
-    LeaveCriticalSection(&g_hdTexCS);
+    ReleaseSRWLockExclusive(&g_hdTexSRW);
 }
 #endif // COSTUME_TRACKING
 
@@ -95,9 +100,9 @@ static DWORD WINAPI HotReloadThreadProc(LPVOID)
     while (WaitForSingleObject(g_hotReloadStop, kIntervalMs) == WAIT_TIMEOUT)
     {
         // Reload textures, hash database, and lazy-load config under the CS.
-        EnterCriticalSection(&g_hdTexCS);
+        AcquireSRWLockExclusive(&g_hdTexSRW);
         if (g_HDTextures) g_HDTextures->HotReload();
-        LeaveCriticalSection(&g_hdTexCS);
+        ReleaseSRWLockExclusive(&g_hdTexSRW);
 
         // Reload shader replacements (hash_table.txt + .bin files).
         // DofPtrMap is NOT cleared — original ptr→hash associations persist.
@@ -302,8 +307,10 @@ static HRESULT STDMETHODCALLTYPE HookCreateDevice(
     DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPP,
     IDirect3DDevice9** ppDevice)
 {
-    spdlog::info("HDTextures: CreateDevice called (Adapter={}, DevType={})",
-                 Adapter, (int)DeviceType);
+    spdlog::info("HDTextures: CreateDevice called (Adapter={}, DevType={}, BehaviorFlags=0x{:X})",
+                 Adapter, (int)DeviceType, BehaviorFlags);
+    // D3DCREATE_PUREDEVICE disables D3DPOOL_MANAGED — strip it so our textures can use managed pool.
+    BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
     HRESULT hr = TrueCreateDevice(pThis, Adapter, DeviceType, hFocusWindow,
                                   BehaviorFlags, pPP, ppDevice);
     spdlog::info("HDTextures: real CreateDevice hr=0x{:08x}", (unsigned)hr);
@@ -343,8 +350,10 @@ static HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
     D3DDISPLAYMODEEX* pFullscreenDisplayMode,
     IDirect3DDevice9Ex** ppDevice)
 {
-    spdlog::info("HDTextures: CreateDeviceEx called (Adapter={}, DevType={})",
-                 Adapter, (int)DeviceType);
+    spdlog::info("HDTextures: CreateDeviceEx called (Adapter={}, DevType={}, BehaviorFlags=0x{:X})",
+                 Adapter, (int)DeviceType, BehaviorFlags);
+    // D3DCREATE_PUREDEVICE disables D3DPOOL_MANAGED — strip it so our textures can use managed pool.
+    BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
     HRESULT hr = TrueCreateDeviceEx(pThis, Adapter, DeviceType, hFocusWindow,
                                     BehaviorFlags, pPP, pFullscreenDisplayMode, ppDevice);
     spdlog::info("HDTextures: real CreateDeviceEx hr=0x{:08x}", (unsigned)hr);
@@ -467,9 +476,9 @@ static HRESULT WINAPI HookDirect3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
 HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::Reset(D3DPRESENT_PARAMETERS* pPP)
 {
     DEV_TRACE("Reset");
-    EnterCriticalSection(&g_hdTexCS);
+    AcquireSRWLockExclusive(&g_hdTexSRW);
     if (g_HDTextures) g_HDTextures->ReleaseTextures();
-    LeaveCriticalSection(&g_hdTexCS);
+    ReleaseSRWLockExclusive(&g_hdTexSRW);
     return m_pReal->Reset(pPP);
 }
 
@@ -481,9 +490,9 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::CreateTexture(
                                         Pool, ppTexture, pSharedHandle);
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (SUCCEEDED(hr) && ppTexture && *ppTexture && g_HDTextures) {
-        EnterCriticalSection(&g_hdTexCS);
+        AcquireSRWLockExclusive(&g_hdTexSRW);
         g_HDTextures->InvalidateTexture(*ppTexture);
-        LeaveCriticalSection(&g_hdTexCS);
+        ReleaseSRWLockExclusive(&g_hdTexSRW);
     }
 #endif
     return hr;
@@ -495,10 +504,19 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::SetTexture(
     IDirect3DBaseTexture9* pFinal = pTexture;
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (pTexture && g_HDTextures) {
-        EnterCriticalSection(&g_hdTexCS);
-        IDirect3DBaseTexture9* pHD = g_HDTextures->OnSetTexture(m_pReal, pTexture);
-        LeaveCriticalSection(&g_hdTexCS);
-        if (pHD) pFinal = pHD;
+        // Fast path: shared lock — concurrent with other SetTexture threads.
+        AcquireSRWLockShared(&g_hdTexSRW);
+        IDirect3DBaseTexture9* pCached = g_HDTextures->TryFastPath(pTexture);
+        ReleaseSRWLockShared(&g_hdTexSRW);
+
+        if (pCached) {
+            pFinal = pCached;
+        } else {
+            // Slow path: exclusive lock — hash, lazy load, GPU upload.
+            AcquireSRWLockExclusive(&g_hdTexSRW);
+            pFinal = g_HDTextures->OnSetTexture(m_pReal, pTexture);
+            ReleaseSRWLockExclusive(&g_hdTexSRW);
+        }
     }
 #endif
     return m_pReal->SetTexture(Stage, pFinal);
@@ -512,7 +530,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
     if (fdwReason == DLL_PROCESS_ATTACH)
     {
         g_hDLL = hInstDLL;
-        InitializeCriticalSection(&g_hdTexCS);
 
         // NOTE: Do NOT call DisableThreadLibraryCalls — static CRT (/MT)
         // requires DLL_THREAD_ATTACH / DLL_THREAD_DETACH notifications.
@@ -525,7 +542,16 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
         LoadRealVersionDll();
 
         std::wstring dllDir = GetDllDir();
-        g_hdTexDir = dllDir;
+        // HDTEX_ASSET_SUBDIR: when defined, assets (hd_textures, hd_textures_shaders) are
+        // looked up in a subdirectory of the DLL location rather than beside the DLL itself.
+        // Used for LR:FFXIII where version.dll lives at the game root but NC Launcher maps
+        // Data\ into weiss_data\, so assets sit at <gameRoot>\weiss_data\ not at <gameRoot>\.
+#ifdef HDTEX_ASSET_SUBDIR
+        std::wstring assetDir = dllDir + L"\\" HDTEX_ASSET_SUBDIR;
+#else
+        std::wstring assetDir = dllDir;
+#endif
+        g_hdTexDir = assetDir;
         std::string logPath =
             std::string(dllDir.begin(), dllDir.end()) + "\\HDTextures.log";
         try {
@@ -537,12 +563,15 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
             spdlog::info("HDTextures mod loaded");
         } catch (...) {}
 
-        LoadShaderHashTable(dllDir + L"\\hd_textures_shaders");
+        LoadShaderHashTable(assetDir + L"\\hd_textures_shaders");
 
-        // Always set dump dir — used by HDTEX_DUMP_SHADERS.
+        // Always set dump dirs — kept at dllDir for dev convenience.
         PSLogger::SetDumpDir(dllDir + L"\\shader_dumps");
 #ifdef HDTEX_DUMP_SHADERS
         spdlog::info("HDTextures: shader dump enabled -> shader_dumps\\");
+#endif
+#ifdef HDTEX_DUMP_TEXTURES
+        HDTextureReplacer::SetTexDumpDir(dllDir + L"\\textures_dump");
 #endif
 
 #ifndef HDTEX_DIAG_NO_CONSTRUCT
@@ -550,9 +579,9 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
             g_HDTexturesOwner = std::make_unique<HDTextureReplacer>();
             g_HDTextures      = g_HDTexturesOwner.get();
 #ifndef HDTEX_DIAG_SKIP_HD_INIT
-            g_HDTextures->Init(dllDir);
+            g_HDTextures->Init(assetDir);
 #ifdef HDTEX_HOT_RELOAD
-            g_shaderDir       = dllDir + L"\\hd_textures_shaders";
+            g_shaderDir       = assetDir + L"\\hd_textures_shaders";
             g_hotReloadStop   = CreateEvent(nullptr, TRUE, FALSE, nullptr);
             g_hotReloadThread = CreateThread(nullptr, 0, HotReloadThreadProc, nullptr, 0, nullptr);
             spdlog::info("HDTextures: hot reload enabled (interval {}s) — textures, hashes, shaders",
@@ -628,7 +657,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
         g_HDTexturesOwner.reset();
         g_HDTextures = nullptr;
         if (g_RealVersion) { FreeLibrary(g_RealVersion); g_RealVersion = nullptr; }
-        DeleteCriticalSection(&g_hdTexCS);
         spdlog::shutdown();
     }
 
