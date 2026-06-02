@@ -44,7 +44,9 @@ static const std::unordered_map<int, CostumeInfo> kCostumeMap = {
     { 181, { "Serah", "Beachwear",       "serah", "serah", "beachwear"        } },
     { 160, { "Serah", "N7 Armor",        "serah", "serah", "n7_armor"         } },
     { 182, { "Serah", "N7 Armor",        "serah", "serah", "n7_armor"         } },
+    { 107, { "Serah", "XIII-1",           "serah", "serah", "XIII"             } },
     { 240, { "Serah", "White Mage",      "serah", "serah", "white_mage"       } },
+    { 241, { "Serah", "White Mage",      "serah", "serah", "white_mage"       } },
     // ── Noel ───────────────────────────────────────────────────────────────
     { 110, { "Noel", "Default",            "noel", "knoel", "default"            } },
     { 140, { "Noel", "Default",            "noel", "knoel", "default"            } },

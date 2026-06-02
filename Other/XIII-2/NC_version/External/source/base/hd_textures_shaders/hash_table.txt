@@ -1,0 +1,31 @@
+
+# FF13-2 shader replacements
+# Format: one hex hash per line; # starts a comment; 0x prefix optional.
+# Each hash must have a corresponding <hash>.bin in this directory.
+# Remove or rename this file entirely to disable shader replacement.
+
+# ── Active replacements ────────────────────────────────────────────────
+af31d3405062ee68    # Gameplay DoF
+f206fbc4baadd122    # Valhalla DoF
+8b0d63a81922561b    # Cutscenes DoF step 1 : Near Blur gather
+b32c3447f7a5418c    # Cutscenes DoF step 2 : Near blur spread/dilation
+67f7f77335ff7a82    # Cutscenes DoF step 3 : Final composition
+e3ffdec520d824b2    # Shadow caster alpha-clip — palm trees, chocobo head
+
+# ── Rain opacity fix ──────────────────────────────────────────────────
+bd38df932e28c100    # Rain particles — opacity fix v3 (ALPHA_SCALE=1.0, smooth pDepth fade, depth blur r=0.05, no maskingMap)
+
+# ── Identified, not currently used ────────────────────────────────────
+#eae12876f9ff0e68    # Portal/aura VFX (c21/c22/c23 family, fog, texColor) — NOT rain
+#200feadb5c743fad    # Dual-sampler VFX particle, SRCALPHA/ONE additive — NOT rain (no red during rain test)
+#0c77c0ebfbdf5637    # Simple dual-sampler VFX particle, SRCALPHA/ONE additive — NOT rain (no red during rain test)
+#7a4eb0bf63f885b6    # VFX with vfxDepthMap soft-particle — no visible change during rain test
+#9d3bd26a41d295a9    # streakSampler blur pass — no visible change during rain test
+#2b5fffe7a43a5c74    # Title screen elements (c171 family, no fog) — NOT rain
+#6bd2128d4fa2ccb9    # Title screen elements (c171/c172 family, texColor tint) — NOT rain
+#bc1ccb5703f12e59    # Title screen elements (c171/c172, same as above unoptimised) — NOT rain
+
+#522053f368f54a2d    # Shadow caster alpha-clip — purpose unknown
+
+
+

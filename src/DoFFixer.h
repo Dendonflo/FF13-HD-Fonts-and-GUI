@@ -13,9 +13,9 @@
 // Configuration directory: hd_textures_shaders\
 //   hash_table.txt  — one hex hash per line; # comments; 0x prefix optional.
 //                     Absent = feature silently disabled.
-//   <hash>.bin      — raw D3D9 pixel shader bytecode to substitute when the
+//   <hash>.cso      — raw D3D9 pixel shader bytecode to substitute when the
 //                     game sets a shader whose bytecode matches <hash>.
-//                     If a .bin is missing for a listed hash, that hash is
+//                     If a .cso is missing for a listed hash, that hash is
 //                     skipped with a warning.
 //
 // Confirmed FF13-2 shader hashes:
@@ -38,7 +38,7 @@
 // object belongs to one device but the replacement must be created per-device.
 
 // ---------------------------------------------------------------------------
-// Replacement data: bytecode loaded from hd_textures_shaders\<hash>.bin
+// Replacement data: bytecode loaded from hd_textures_shaders\<hash>.cso
 // ---------------------------------------------------------------------------
 struct ShaderReplacement {
     std::vector<DWORD> bytecode;
@@ -104,20 +104,20 @@ inline int LoadShaderHashTable(const std::wstring& dir)
             continue;
         }
 
-        // Build path to replacement .bin
+        // Build path to replacement .cso
         wchar_t binName[32];
-        swprintf_s(binName, L"%016llx.bin", static_cast<unsigned long long>(hash));
+        swprintf_s(binName, L"%016llx.cso", static_cast<unsigned long long>(hash));
         std::wstring binPath = dir + L"\\" + binName;
 
         // Load bytecode
         std::ifstream bin(binPath, std::ios::binary | std::ios::ate);
         if (!bin.is_open()) {
-            spdlog::warn("DoFFixer: no replacement .bin found for {:016x} — skipping", hash);
+            spdlog::warn("DoFFixer: no replacement .cso found for {:016x} — skipping", hash);
             continue;
         }
         auto size = bin.tellg();
         if (size <= 0 || size % sizeof(DWORD) != 0) {
-            spdlog::warn("DoFFixer: invalid .bin size {} for {:016x} — skipping", (long long)size, hash);
+            spdlog::warn("DoFFixer: invalid .cso size {} for {:016x} — skipping", (long long)size, hash);
             continue;
         }
         bin.seekg(0);
@@ -125,7 +125,7 @@ inline int LoadShaderHashTable(const std::wstring& dir)
         rep.bytecode.resize(static_cast<size_t>(size) / sizeof(DWORD));
         bin.read(reinterpret_cast<char*>(rep.bytecode.data()), size);
         if (!bin) {
-            spdlog::warn("DoFFixer: read error for {:016x} .bin — skipping", hash);
+            spdlog::warn("DoFFixer: read error for {:016x} .cso — skipping", hash);
             continue;
         }
 
@@ -135,7 +135,7 @@ inline int LoadShaderHashTable(const std::wstring& dir)
     }
 
     spdlog::info("DoFFixer: {} shader replacement(s) loaded — shader replacement {}",
-                 count, count > 0 ? "enabled" : "disabled (no valid .bin files)");
+                 count, count > 0 ? "enabled" : "disabled (no valid .cso files)");
     return count;
 }
 
@@ -189,7 +189,7 @@ public:
         if (!pFunction || !pShader) return;
         uint64_t h = DoF_HashBytecode(pFunction);
         // Track if it has a replacement OR is the cutscene detection hash.
-        // kCutsceneDofHash is hardcoded so it's tracked even without a .bin.
+        // kCutsceneDofHash is hardcoded so it's tracked even without a .cso.
         bool track = (h == kCutsceneDofHash) ||
                      (!DofReplacementMap().empty() && DofReplacementMap().count(h));
         if (!track) return;
@@ -216,7 +216,7 @@ public:
 
     // Returns true if pShader's bytecode hash is the cutscene DoF compositor.
     // Requires the hash to be registered in DofPtrMap (i.e. listed in
-    // hash_table.txt with a valid .bin).
+    // hash_table.txt with a valid .cso).
     static bool IsCutsceneDofShader(IDirect3DPixelShader9* pShader) {
         if (!pShader) return false;
         auto it = DofPtrMap().find(pShader);
@@ -247,7 +247,7 @@ private:
 // ReloadShaderHashTable — hot-reload wrapper around LoadShaderHashTable.
 //
 // Clears DofReplacementMap and the per-device compiled replacement caches on
-// every registered DoFFixer, then re-reads hash_table.txt + .bin files from disk.
+// every registered DoFFixer, then re-reads hash_table.txt + .cso files from disk.
 //
 // DofPtrMap is intentionally NOT cleared: original-shader-ptr → hash associations
 // are valid for the lifetime of those D3D9 shader objects. The game won't
