@@ -737,6 +737,11 @@ private:
     HDTextureReplacer*  m_pTexReplacer;
     volatile LONG       m_refCount;
     DoFFixer            m_dofFixer;
+
+    // Tracks which original game texture pointer is currently bound to each stage.
+    // Updated in SetTexture before any HD swap; used by ConsumeHashResults to push
+    // HD replacements to stages the game bound once and never touched again.
+    std::unordered_map<DWORD, IDirect3DBaseTexture9*> m_currentTextures;
 #ifdef SHADOW_ALPHA_FIX
     bool                m_inShadowPass   = false;
     DWORD               m_savedAlphaTest = FALSE;

@@ -59,10 +59,12 @@ public:
     IDirect3DBaseTexture9* TryFastPath(IDirect3DBaseTexture9* pTexture);
 
     // Called from SetTexture hook — identifies texture by hash, swaps if HD available.
-    // Needs device pointer to create HD textures on first match.
+    // currentTextures: proxy stage->pointer map for proactive HD push.
     // Always called under exclusive (SRW write) lock.
-    IDirect3DBaseTexture9* OnSetTexture(IDirect3DDevice9* pDevice,
-                                        IDirect3DBaseTexture9* pTexture);
+    IDirect3DBaseTexture9* OnSetTexture(
+        IDirect3DDevice9* pDevice,
+        IDirect3DBaseTexture9* pTexture,
+        const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures);
 
     void ReleaseTextures();
 
@@ -243,11 +245,16 @@ private:
     HANDLE                                                  hashThread_    = nullptr;
     HANDLE                                                  hashSemaphore_ = nullptr;
     std::atomic<bool>                                       hashStop_      { false };
+    // Set by hash thread (and preload thread) whenever they push a result.
+    // Cleared by ConsumeHashResults after stealing the queue.
+    // TryFastPath checks this to force the exclusive-lock path on stable scenes.
+    std::atomic<bool>                                       hashResultsReady_ { false };
 
     void StartHashThread();
     void StopHashThread();
     void QueueHashJob(IDirect3DBaseTexture9* pTex);        // under SRWLock exclusive
-    void ConsumeHashResults(IDirect3DDevice9* pDevice);    // under SRWLock exclusive
+    void ConsumeHashResults(IDirect3DDevice9* pDevice,
+        const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures); // under SRWLock exclusive
     static DWORD WINAPI HashThreadProc(LPVOID pThis);
 
 #ifdef HDTEX_HOT_RELOAD
@@ -841,6 +848,7 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         {
             std::lock_guard<std::mutex> lk(self->hashMtx_);
             self->hashResults_.push_back(std::move(res));
+            self->hashResultsReady_.store(true, std::memory_order_release);
             continue;
         }
 
@@ -850,6 +858,7 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         {
             std::lock_guard<std::mutex> lk(self->hashMtx_);
             self->hashResults_.push_back(std::move(res));
+            self->hashResultsReady_.store(true, std::memory_order_release);
             continue;
         }
 
@@ -863,6 +872,7 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         {
             std::lock_guard<std::mutex> lk(self->hashMtx_);
             self->hashResults_.push_back(std::move(res));
+            self->hashResultsReady_.store(true, std::memory_order_release);
             continue;
         }
 
@@ -874,6 +884,7 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
             // Non-lockable texture (DEFAULT pool, not DYNAMIC) — permanent miss.
             std::lock_guard<std::mutex> lk(self->hashMtx_);
             self->hashResults_.push_back(std::move(res));
+            self->hashResultsReady_.store(true, std::memory_order_release);
             continue;
         }
 
@@ -886,9 +897,6 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         res.hash = h;
 
         // hashDB is populated in Init() and never modified during normal operation.
-        // (During hot-reload it is rebuilt under SRWLock exclusive, which cannot run
-        // concurrently with this thread — the worst case is a stale lookup in the
-        // dev-only hot-reload build, which is benign.)
         auto dbIt = self->hashDB.find(h);
         if (dbIt != self->hashDB.end())
         {
@@ -899,6 +907,7 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         {
             std::lock_guard<std::mutex> lk(self->hashMtx_);
             self->hashResults_.push_back(std::move(res));
+            self->hashResultsReady_.store(true, std::memory_order_release);
         }
     }
     return 0;
@@ -926,13 +935,24 @@ inline void HDTextureReplacer::QueueHashJob(IDirect3DBaseTexture9* pTex)
 
 // -----------------------------------------------------------------------
 // ConsumeHashResults — process completed hash results on the render thread.
-//   - matches: look up / create HD texture, populate textureMap
+//   - matches: look up / create HD texture, populate textureMap, push to GPU
 //   - misses:  add to checkedTextures
 //   - lazy-tile matches whose preload isn't ready yet: park in preloadWaiting_
 // Must be called under SRWLock exclusive.
 // -----------------------------------------------------------------------
-inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
+inline void HDTextureReplacer::ConsumeHashResults(
+    IDirect3DDevice9* pDevice,
+    const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures)
 {
+    // Helper: for every stage that currently has pOrig bound, push the HD
+    // replacement directly to the real device.  This covers textures the game
+    // bound once (dirty-state cache) and will never rebind on its own.
+    auto PushToStages = [&](IDirect3DBaseTexture9* pOrig, IDirect3DTexture9* pHD) {
+        for (auto& [stage, pBound] : currentTextures)
+            if (pBound == pOrig)
+                pDevice->SetTexture(stage, pHD);
+    };
+
     // 1. Check preload-waiting entries — promote those whose DDS data has arrived.
     if (!preloadWaiting_.empty())
     {
@@ -964,6 +984,7 @@ inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
                 nameToHDTex[re.texName] = hdTex;
                 textureMap[re.pTex]     = hdTex;
                 pointerKey[re.pTex]     = re.texName;
+                PushToStages(re.pTex, hdTex);
                 spdlog::info("HDTextures: MATCH(preload-ready) '{}' -> {}x{}",
                              re.texName, hdData.at(re.texName).hdW, hdData.at(re.texName).hdH);
             }
@@ -976,13 +997,20 @@ inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
         }
     }
 
-    // 2. Steal the hash results queue (brief lock).
+    // 2. Steal the hash results queue and clear the ready flag.
+    // Flag is cleared inside hashMtx_ so neither thread can push between
+    // the swap and the clear; if they push after we release, the flag is
+    // set again and we'll drain on the next SetTexture call.
+    // We do NOT bail early on an empty batch — the preload thread may have
+    // set the flag without producing any hash results.
     std::deque<HashResult> batch;
     {
         std::lock_guard<std::mutex> lk(hashMtx_);
-        if (hashResults_.empty()) return;
         batch.swap(hashResults_);
+        hashResultsReady_.store(false, std::memory_order_relaxed);
     }
+
+    if (batch.empty() && preloadWaiting_.empty()) return;
 
     for (auto& r : batch)
     {
@@ -1045,6 +1073,7 @@ inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
             }
             textureMap[r.pTex] = nameIt->second;
             pointerKey[r.pTex] = texName;
+            PushToStages(r.pTex, nameIt->second);
             r.pTex->Release();
             continue;
         }
@@ -1095,6 +1124,7 @@ inline void HDTextureReplacer::ConsumeHashResults(IDirect3DDevice9* pDevice)
         nameToHDTex[texName] = hdTex;
         textureMap[r.pTex]   = hdTex;
         pointerKey[r.pTex]   = texName;
+        PushToStages(r.pTex, hdTex);
 
         if (!numberedPrefix.empty())
         {
@@ -1177,6 +1207,7 @@ inline DWORD WINAPI HDTextureReplacer::PreloadThreadProc(LPVOID pThis)
             std::lock_guard<std::mutex> lk(self->preloadMtx_);
             self->preloadReady_[job.texName] = std::move(hd);
             spdlog::debug("HDTextures: preloaded '{}'", job.texName);
+            self->hashResultsReady_.store(true, std::memory_order_release);
         }
         else
         {
@@ -1254,9 +1285,26 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::TryFastPath(IDirect3DBaseTextur
 
     if (checkedTextures.count(pTexture)) return pTexture;
 
-    // Already queued for hashing or waiting for lazy preload data — use original this frame.
-    if (pendingJobId_.count(pTexture))   return pTexture;
-    if (preloadWaiting_.count(pTexture)) return pTexture;
+    // Textures waiting for preload data: pass through unless the preload is
+    // actually done (hashResultsReady_ set by PreloadThreadProc).  In that
+    // case fall through to the drain path so ConsumeHashResults can promote
+    // the entry.  Without this check the preload-waiting texture intercepts
+    // first and the drain never fires on screens where it's the only texture
+    // being bound (e.g. shop031 zone preview).
+    if (preloadWaiting_.count(pTexture))
+    {
+        if (hashResultsReady_.load(std::memory_order_acquire)) return nullptr;
+        return pTexture;
+    }
+
+    // If either thread has results ready, force the exclusive-lock path so
+    // ConsumeHashResults runs even on a stable scene with no new textures.
+    // This check MUST come before pendingJobId_ so that textures sitting in
+    // the hash pipeline trigger the drain once their result arrives.
+    if (hashResultsReady_.load(std::memory_order_acquire)) return nullptr;
+
+    // Already queued for hashing — use original until result arrives.
+    if (pendingJobId_.count(pTexture)) return pTexture;
 
     return nullptr; // true cache miss — caller must escalate to exclusive lock
 }
@@ -1269,14 +1317,17 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::TryFastPath(IDirect3DBaseTextur
 // background hash thread.  This function only processes completed results
 // and queues new work; it never blocks on LockRect or hash computation.
 // -----------------------------------------------------------------------
-inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* pDevice,
-                                                              IDirect3DBaseTexture9* pTexture)
+inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(
+    IDirect3DDevice9* pDevice,
+    IDirect3DBaseTexture9* pTexture,
+    const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures)
 {
     if (!pTexture || hashDB.empty()) return pTexture;
 
     // Drain any results the hash thread (or preload thread) has completed.
-    // This may populate textureMap / checkedTextures for textures seen earlier.
-    ConsumeHashResults(pDevice);
+    // This may populate textureMap / checkedTextures for textures seen earlier,
+    // and proactively push HD textures to stages the game hasn't rebound.
+    ConsumeHashResults(pDevice, currentTextures);
 
     // Fast path: already mapped to an HD texture (may have just been populated above).
     auto mapIt = textureMap.find(pTexture);

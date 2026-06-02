@@ -476,6 +476,7 @@ static HRESULT WINAPI HookDirect3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
 HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::Reset(D3DPRESENT_PARAMETERS* pPP)
 {
     DEV_TRACE("Reset");
+    m_currentTextures.clear();
     AcquireSRWLockExclusive(&g_hdTexSRW);
     if (g_HDTextures) g_HDTextures->ReleaseTextures();
     ReleaseSRWLockExclusive(&g_hdTexSRW);
@@ -501,6 +502,10 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::CreateTexture(
 HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::SetTexture(
     DWORD Stage, IDirect3DBaseTexture9* pTexture)
 {
+    // Record original pointer before any swap so ConsumeHashResults can
+    // proactively push HD textures to stages the game won't rebind.
+    m_currentTextures[Stage] = pTexture;
+
     IDirect3DBaseTexture9* pFinal = pTexture;
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (pTexture && g_HDTextures) {
@@ -512,9 +517,9 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::SetTexture(
         if (pCached) {
             pFinal = pCached;
         } else {
-            // Slow path: exclusive lock — hash, lazy load, GPU upload.
+            // Slow path: exclusive lock — drain results, queue new hash job.
             AcquireSRWLockExclusive(&g_hdTexSRW);
-            pFinal = g_HDTextures->OnSetTexture(m_pReal, pTexture);
+            pFinal = g_HDTextures->OnSetTexture(m_pReal, pTexture, m_currentTextures);
             ReleaseSRWLockExclusive(&g_hdTexSRW);
         }
     }
