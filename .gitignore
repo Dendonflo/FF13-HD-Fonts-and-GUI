@@ -1,7 +1,6 @@
 # Build intermediates
-Release/obj/
-Release/*.lib
-Release/*.exp
+Release/
+Other/
 
 # Log files
 *.log
