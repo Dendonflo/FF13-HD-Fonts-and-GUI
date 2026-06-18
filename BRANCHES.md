@@ -80,7 +80,12 @@ the Release hook). Without the flag, hashing is fully synchronous as above.
 |------|:---:|:---:|:---:|
 | FF13-1 | off | — | off |
 | FF13-2 | off | — | on |
-| LR:FFXIII | **on** | `weiss_data` | off (LR map TBD) |
+| LR:FFXIII | **on** | `weiss_data` | off |
+
+`HDTEX_ASSET_SUBDIR=<name>` (no quotes) changes the base path for `hd_textures\` from
+the DLL directory to `<DLL dir>\<name>\hd_textures\`. Required for LR because its asset
+root is `weiss_data\` rather than sitting next to the DLL. The resolved path is logged
+at startup (`HDTextures: asset root -> ...`) to make misconfiguration obvious.
 
 **Status:** Compile-verified in both sync and async configurations. Not yet
 tested in-game in either.

@@ -287,9 +287,27 @@ inline void HDTextureReplacer::ScanHDSubdir(const std::wstring& subDirPath,
     spdlog::debug("HDTextures: indexed {} DDS path(s) in '{}'", count, ns);
 }
 
+// Compile-time wide-string conversion for HDTEX_ASSET_SUBDIR.
+// Define HDTEX_ASSET_SUBDIR=weiss_data (no quotes) in the project to
+// look for hd_textures\ inside that subdirectory instead of next to the DLL.
+#ifdef HDTEX_ASSET_SUBDIR
+#  define HDTEX_STRINGIFY_(x) #x
+#  define HDTEX_STRINGIFY(x)  HDTEX_STRINGIFY_(x)
+#  define HDTEX_WIDEN_(s)     L##s
+#  define HDTEX_WIDEN(s)      HDTEX_WIDEN_(s)
+#  define HDTEX_SUBDIR_W      HDTEX_WIDEN(HDTEX_STRINGIFY(HDTEX_ASSET_SUBDIR))
+#endif
+
 inline void HDTextureReplacer::Init(const std::wstring& modDir)
 {
+#ifdef HDTEX_ASSET_SUBDIR
+    m_hdRoot = modDir + L"\\" HDTEX_SUBDIR_W L"\\hd_textures";
+#else
     m_hdRoot = modDir + L"\\hd_textures";
+#endif
+
+    spdlog::info("HDTextures: asset root -> {}",
+                 std::string(m_hdRoot.begin(), m_hdRoot.end()));
 
     if (!LoadHashDB())
         return;
@@ -457,7 +475,12 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(
 
     D3DLOCKED_RECT locked;
     if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
+    {
+        spdlog::info("HDTextures: LockRect failed {}x{} fmt={} pool={} usage=0x{:X} — texture not hashable",
+                     desc.Width, desc.Height, (int)desc.Format, (int)desc.Pool, desc.Usage);
+        checkedTextures.insert(pTexture); // don't retry every frame
         return pTexture;
+    }
 
     uint64_t h = 14695981039346656037ULL;
     const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
@@ -473,7 +496,10 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(
 
     auto dbIt = hashDB.find(h);
     if (dbIt == hashDB.end())
+    {
+        spdlog::debug("HDTextures: miss {:016x} {}x{} fmt={}", h, desc.Width, desc.Height, (int)desc.Format);
         return pTexture;
+    }
 
     const std::string& texName = dbIt->second;
 
@@ -498,8 +524,8 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(
     pointerKey[pTexture]  = texName;
     nameRefs[texName]     = 1;
 
-    spdlog::debug("HDTextures: '{}' matched by hash {:016x}, swapped to HD",
-                  texName, h);
+    spdlog::info("HDTextures: loaded '{}' {:016x} {}x{}",
+                 texName, h, desc.Width, desc.Height);
 
     return hdTex;
 #endif // HDTEX_ASYNC_HASH
@@ -681,6 +707,8 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
         {
             // Non-lockable (DEFAULT pool, not DYNAMIC) — treat as permanent miss.
+            spdlog::info("HDTextures: [async] LockRect failed {}x{} fmt={} pool={} usage=0x{:X} — not hashable",
+                         desc.Width, desc.Height, (int)desc.Format, (int)desc.Pool, desc.Usage);
             pushResult();
             continue;
         }
@@ -778,8 +806,8 @@ inline void HDTextureReplacer::ConsumeHashResults(
         nameRefs[r.texName]    = 1;
         pushToStages(r.pTex, hdTex);
 
-        spdlog::debug("HDTextures: async MATCH '{}' {:016x} {}x{} -> {}x{}",
-                      r.texName, r.hash, r.srcW, r.srcH, r.hdW, r.hdH);
+        spdlog::info("HDTextures: [async] loaded '{}' {:016x} {}x{} -> {}x{}",
+                     r.texName, r.hash, r.srcW, r.srcH, r.hdW, r.hdH);
 
         // Release our pipeline AddRef. If the game already let go of r.pTex
         // while it was in flight, this drops it to zero and the Release hook
