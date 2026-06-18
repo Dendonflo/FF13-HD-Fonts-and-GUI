@@ -56,6 +56,16 @@ public:
     // Called from CreateTexture hook — evicts stale cache entries for reused pointers.
     void InvalidateTexture(IDirect3DBaseTexture9* pTexture);
 
+#ifdef HDTEX_RELEASE_TRACKING
+    // Called from the IDirect3DTexture9::Release vtable hook when an original
+    // game texture's refcount reaches zero. Drops all cache entries for that
+    // pointer and, once the last pointer referencing a given HD texture is gone,
+    // releases the HD GPU texture (and frees lazy pixel data). This replaces the
+    // LRU/group-flush machinery: VRAM is reclaimed exactly when the game frees
+    // its own original, with no scene-number heuristics or VRAM caps.
+    void OnOriginalReleased(IDirect3DBaseTexture9* pTexture);
+#endif
+
     // Called from the CostumeTracker callback (under g_hdTexCS) to swap the pixel
     // data for one gui_resident face texture without a full reload.
     // Releases the existing GPU texture for texName so it will be re-uploaded on the
@@ -133,6 +143,18 @@ private:
     // Active numbered groups, keyed by prefix (e.g. "map_scene", "shop_").
     // Each group owns its LRU and tracks its current active number.
     std::unordered_map<std::string, NumberedGroup> numberedGroups;
+
+#ifdef HDTEX_RELEASE_TRACKING
+    // Live original-pointer count per HD texture name. While > 0 the HD texture
+    // stays resident; when it hits 0 (last original released) the HD texture is
+    // released. Lets several game pointers — the same logical texture reloaded at
+    // new addresses — share one HD texture without premature free or thrash.
+    std::unordered_map<std::string, int> nameRefs;
+
+    // Release the HD GPU texture for a name, drop it from any group LRU, and free
+    // its lazy pixel data (static pixel data is kept). Called when nameRefs hits 0.
+    void ReleaseHDByName(const std::string& name);
+#endif
 
     // Root path of hd_textures\ — stored so HotReload() can re-scan without re-running Init().
     std::wstring m_hdRoot;
@@ -513,6 +535,9 @@ inline void HDTextureReplacer::HotReload()
     checkedTextures.clear();
     pointerKey.clear();
     numberedGroups.clear();
+#ifdef HDTEX_RELEASE_TRACKING
+    nameRefs.clear();
+#endif
 
     // Drop all pixel data and lazy paths so RescanDisk reads fresh bytes.
     hdData.clear();
@@ -598,13 +623,17 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
         if (group.lruCap == 0)
             group.lruCap = LruCapForPrefix(pfx);
 
+#ifndef HDTEX_RELEASE_TRACKING
         // Flush the old namespace when the active number changes.
+        // With release tracking, old tiles are freed when the game releases
+        // them, so this scene-switch heuristic is unnecessary.
         if (!group.currentNumber.empty() && group.currentNumber != num)
         {
             spdlog::debug("HDTextures: numbered group switching '{}{}' -> '{}{}'",
                           pfx, group.currentNumber, pfx, num);
             FlushGroup(pfx, group);
         }
+#endif
         group.currentNumber = num;
     }
 
@@ -615,6 +644,7 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
         auto nameIt = nameToHDTex.find(texName);
         if (nameIt != nameToHDTex.end())
         {
+#ifndef HDTEX_RELEASE_TRACKING
             // Touch LRU for numbered tiles.
             if (!numberedPrefix.empty())
             {
@@ -627,9 +657,14 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
                     group.lruIndex[texName] = group.lruOrder.begin();
                 }
             }
+#endif
 
             textureMap[pTexture] = nameIt->second;   // non-owning fast-path
             pointerKey[pTexture] = texName;
+#ifdef HDTEX_RELEASE_TRACKING
+            // New original pointer referencing this HD texture.
+            nameRefs[texName]++;
+#endif
             return nameIt->second;
         }
     }
@@ -666,6 +701,10 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
     textureMap[pTexture]  = hdTex;   // non-owning fast-path
     pointerKey[pTexture]  = texName;
 
+#ifdef HDTEX_RELEASE_TRACKING
+    // First original pointer referencing this freshly created HD texture.
+    nameRefs[texName]++;
+#else
     // Numbered tiles: register in group LRU and evict if over cap.
     if (!numberedPrefix.empty())
     {
@@ -676,6 +715,7 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
         while (group.lruOrder.size() > group.lruCap)
             EvictOldest(numberedPrefix, group);
     }
+#endif
 
     spdlog::debug("HDTextures: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
                   texName, h, desc.Width, desc.Height,
@@ -710,6 +750,10 @@ inline void HDTextureReplacer::ReleaseTextures()
     checkedTextures.clear();
     pointerKey.clear();
 
+#ifdef HDTEX_RELEASE_TRACKING
+    nameRefs.clear();
+#endif
+
     // Free lazily-loaded pixel data (map scenes).
     // Preloaded pixel data (shops, gui_resident) is kept — it came from Init().
     for (auto it = hdData.begin(); it != hdData.end(); )
@@ -722,12 +766,74 @@ inline void HDTextureReplacer::ReleaseTextures()
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::InvalidateTexture(IDirect3DBaseTexture9* pTexture)
 {
+#ifdef HDTEX_RELEASE_TRACKING
+    // A reused pointer means the previous object at this address was freed.
+    // Treat it exactly like a release: drop the caches and decref the HD texture.
+    // (With the Release hook installed this is usually a no-op — the hook already
+    //  ran on the real free — but it keeps accounting correct if the hook missed.)
+    OnOriginalReleased(pTexture);
+#else
     // textureMap is non-owning for ALL textures — just remove the entry, no Release.
     // nameToHDTex remains the owner; the HD texture stays resident for future reuse.
     textureMap.erase(pTexture);
     checkedTextures.erase(pTexture);
     pointerKey.erase(pTexture);
+#endif
 }
+
+
+#ifdef HDTEX_RELEASE_TRACKING
+// -----------------------------------------------------------------------
+// OnOriginalReleased — an original game texture's refcount hit zero.
+// Drop its caches; when the last original referencing an HD texture is gone,
+// release the HD texture. Must be called under g_hdTexCS.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::OnOriginalReleased(IDirect3DBaseTexture9* pTexture)
+{
+    // Always drop the cheap caches (covers the no-match case too, which keeps
+    // checkedTextures from growing without bound over a long session).
+    textureMap.erase(pTexture);
+    checkedTextures.erase(pTexture);
+
+    auto it = pointerKey.find(pTexture);
+    if (it == pointerKey.end())
+        return;   // not one of ours (or already cleaned up)
+
+    const std::string name = it->second;
+    pointerKey.erase(it);
+
+    auto rc = nameRefs.find(name);
+    if (rc == nameRefs.end())
+        return;
+    if (--rc->second > 0)
+        return;   // other originals still reference this HD texture
+
+    nameRefs.erase(rc);
+    ReleaseHDByName(name);
+}
+
+
+// -----------------------------------------------------------------------
+// ReleaseHDByName — release the HD GPU texture for a name and free its lazy
+// pixel data. Static pixel data (gui_resident, fonts, shops) is kept resident.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::ReleaseHDByName(const std::string& name)
+{
+    auto nit = nameToHDTex.find(name);
+    if (nit != nameToHDTex.end())
+    {
+        if (nit->second) nit->second->Release();
+        nameToHDTex.erase(nit);
+    }
+
+    // Free lazy-loaded pixel data so RAM tracks what is actually in use.
+    // Preloaded/static pixel data stays so it never needs a disk re-read.
+    if (lazyPaths.count(name))
+        hdData.erase(name);
+
+    spdlog::debug("HDTextures: released HD '{}' (last original freed)", name);
+}
+#endif // HDTEX_RELEASE_TRACKING
 
 
 // -----------------------------------------------------------------------

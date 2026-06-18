@@ -461,6 +461,55 @@ static HRESULT WINAPI HookDirect3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
     return S_OK;
 }
 
+#ifdef HDTEX_RELEASE_TRACKING
+// -------------------------------------------------------------------
+// IDirect3DTexture9::Release vtable hook
+//
+// All IDirect3DTexture9 instances from the game's d3d9.dll share one vtable.
+// We patch slot 2 (Release) once, so we learn the instant any texture's
+// refcount reaches zero and can release the matching HD texture immediately —
+// no scene-number heuristics, no LRU cap. Our own HD textures share the same
+// vtable, so the hook re-enters when we release them; that is harmless because
+// HD pointers are not keys in the replacer's pointer map (OnOriginalReleased
+// no-ops on them). g_hdTexCS is a recursive CRITICAL_SECTION, so the re-entry
+// on the same thread does not deadlock.
+// -------------------------------------------------------------------
+using TexReleaseFn = ULONG(STDMETHODCALLTYPE*)(IDirect3DTexture9*);
+static TexReleaseFn g_origTexRelease = nullptr;
+static void**       g_texVTable      = nullptr;
+
+static ULONG STDMETHODCALLTYPE HookedTexRelease(IDirect3DTexture9* self)
+{
+    const ULONG ref = g_origTexRelease(self);
+    if (ref == 0 && g_HDTextures) {
+        EnterCriticalSection(&g_hdTexCS);
+        g_HDTextures->OnOriginalReleased(self);
+        LeaveCriticalSection(&g_hdTexCS);
+    }
+    return ref;
+}
+
+// Patch the shared IDirect3DTexture9 vtable once, using the first texture seen.
+static void InstallTexReleaseHook(IDirect3DTexture9* tex)
+{
+    if (g_texVTable || !tex) return;
+
+    void** vtbl = *reinterpret_cast<void***>(tex);
+    DWORD oldProt = 0;
+    if (!VirtualProtect(&vtbl[2], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt)) {
+        spdlog::error("HDTextures: VirtualProtect failed installing Release hook");
+        return;
+    }
+    g_origTexRelease = reinterpret_cast<TexReleaseFn>(vtbl[2]);
+    vtbl[2]          = reinterpret_cast<void*>(&HookedTexRelease);
+    VirtualProtect(&vtbl[2], sizeof(void*), oldProt, &oldProt);
+    g_texVTable = vtbl;
+
+    spdlog::info("HDTextures: installed IDirect3DTexture9::Release hook (vtbl={:p})",
+                 (void*)vtbl);
+}
+#endif // HDTEX_RELEASE_TRACKING
+
 // -------------------------------------------------------------------
 // IDirect3DDevice9Proxy — three intercepted methods
 // -------------------------------------------------------------------
@@ -481,6 +530,10 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::CreateTexture(
                                         Pool, ppTexture, pSharedHandle);
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (SUCCEEDED(hr) && ppTexture && *ppTexture && g_HDTextures) {
+#ifdef HDTEX_RELEASE_TRACKING
+        // Patch the shared texture vtable on the first texture we ever see.
+        InstallTexReleaseHook(*ppTexture);
+#endif
         EnterCriticalSection(&g_hdTexCS);
         g_HDTextures->InvalidateTexture(*ppTexture);
         LeaveCriticalSection(&g_hdTexCS);

@@ -39,7 +39,7 @@
       <!-- Add SHADOW_ALPHA_FIX to enable the R32F shadow-pass alpha-test fix.
            Fixes transparent shadows on palm trees / chocobo heads.
            Leave absent for release until tested on all maps. -->
-      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;COSTUME_TRACKING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;SPDLOG_WCHAR_TO_UTF8_SUPPORT;SPDLOG_DISABLE_DEFAULT_LOGGER;COSTUME_TRACKING;HDTEX_RELEASE_TRACKING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>
         $(ProjectDir)src;
         $(ProjectDir)Deps\spdlog;

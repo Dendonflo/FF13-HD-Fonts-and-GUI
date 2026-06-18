@@ -2,6 +2,7 @@
 Release/obj/
 Release/*.lib
 Release/*.exp
+Release/*.dll
 
 # Log files
 *.log
