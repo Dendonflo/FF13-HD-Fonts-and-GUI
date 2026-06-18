@@ -85,6 +85,18 @@ public:
     static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                         D3DFORMAT& format, std::vector<uint8_t>& pixelData);
 
+#ifdef HDTEX_DUMP_TEXTURES
+    // Set output directory for texture dumps (created on first use).
+    // Call before Init(). Dumps are named <hash16hex>.dds and skipped if already present.
+    static void SetDumpDir(const std::wstring& dir);
+    static void DumpTextureDDS(uint64_t hash, D3DFORMAT fmt, UINT w, UINT h,
+                               const void* pBits, INT pitch,
+                               UINT rowPitch, UINT rowCount);
+private:
+    inline static std::wstring s_dumpDir;
+public:
+#endif
+
 #ifdef HDTEX_HOT_RELOAD
     void HotReload();
 #endif
@@ -1034,3 +1046,113 @@ inline bool HDTextureReplacer::ReadDDS(const std::wstring& path, UINT& width, UI
 
     return f.gcount() == static_cast<std::streamsize>(dataSize);
 }
+
+
+#ifdef HDTEX_DUMP_TEXTURES
+// -----------------------------------------------------------------------
+// DumpTextureDDS — write a locked texture surface to <dumpDir>\<hash>.dds.
+// Skips if the file already exists so repeated binds of the same texture
+// don't thrash disk. Only the top mip is dumped (what we hash).
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::SetDumpDir(const std::wstring& dir)
+{
+    s_dumpDir = dir;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    spdlog::info("HDTextures: texture dump dir -> {}", std::string(dir.begin(), dir.end()));
+}
+
+inline void HDTextureReplacer::DumpTextureDDS(uint64_t hash, D3DFORMAT fmt,
+                                              UINT w, UINT h,
+                                              const void* pBits, INT pitch,
+                                              UINT rowPitch, UINT rowCount)
+{
+    if (s_dumpDir.empty()) return;
+
+    wchar_t fname[32];
+    swprintf_s(fname, L"%016llx.dds", (unsigned long long)hash);
+    std::wstring path = s_dumpDir + L"\\" + fname;
+
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return; // already dumped
+
+    uint8_t hdr[128] = {};
+    memcpy(hdr, "DDS ", 4);
+    *reinterpret_cast<uint32_t*>(hdr + 4)  = 124; // dwSize
+    *reinterpret_cast<uint32_t*>(hdr + 12) = h;
+    *reinterpret_cast<uint32_t*>(hdr + 16) = w;
+    *reinterpret_cast<uint32_t*>(hdr + 76) = 32;  // ddspf.dwSize
+    *reinterpret_cast<uint32_t*>(hdr + 108) = 0x1000; // DDSCAPS_TEXTURE
+
+    uint32_t flags = 0x1007; // DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
+
+    switch (fmt)
+    {
+        case D3DFMT_DXT1:
+            flags |= 0x80000; // DDSD_LINEARSIZE
+            *reinterpret_cast<uint32_t*>(hdr + 20) = ((w+3)/4) * ((h+3)/4) * 8;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x4;        // DDPF_FOURCC
+            *reinterpret_cast<uint32_t*>(hdr + 84) = 0x31545844; // "DXT1"
+            break;
+        case D3DFMT_DXT3:
+            flags |= 0x80000;
+            *reinterpret_cast<uint32_t*>(hdr + 20) = ((w+3)/4) * ((h+3)/4) * 16;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x4;
+            *reinterpret_cast<uint32_t*>(hdr + 84) = 0x33545844; // "DXT3"
+            break;
+        case D3DFMT_DXT5:
+            flags |= 0x80000;
+            *reinterpret_cast<uint32_t*>(hdr + 20) = ((w+3)/4) * ((h+3)/4) * 16;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x4;
+            *reinterpret_cast<uint32_t*>(hdr + 84) = 0x35545844; // "DXT5"
+            break;
+        case D3DFMT_A8R8G8B8:
+            flags |= 0x8; // DDSD_PITCH
+            *reinterpret_cast<uint32_t*>(hdr + 20) = w * 4;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x41;       // DDPF_RGB | DDPF_ALPHAPIXELS
+            *reinterpret_cast<uint32_t*>(hdr + 88) = 32;
+            *reinterpret_cast<uint32_t*>(hdr + 92) = 0x00FF0000;
+            *reinterpret_cast<uint32_t*>(hdr + 96) = 0x0000FF00;
+            *reinterpret_cast<uint32_t*>(hdr + 100) = 0x000000FF;
+            *reinterpret_cast<uint32_t*>(hdr + 104) = 0xFF000000;
+            break;
+        case D3DFMT_A4R4G4B4:
+            flags |= 0x8;
+            *reinterpret_cast<uint32_t*>(hdr + 20) = w * 2;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x41;
+            *reinterpret_cast<uint32_t*>(hdr + 88) = 16;
+            *reinterpret_cast<uint32_t*>(hdr + 92) = 0x0F00;
+            *reinterpret_cast<uint32_t*>(hdr + 96) = 0x00F0;
+            *reinterpret_cast<uint32_t*>(hdr + 100) = 0x000F;
+            *reinterpret_cast<uint32_t*>(hdr + 104) = 0xF000;
+            break;
+        case D3DFMT_L8:
+            flags |= 0x8;
+            *reinterpret_cast<uint32_t*>(hdr + 20) = w;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x20000;    // DDPF_LUMINANCE
+            *reinterpret_cast<uint32_t*>(hdr + 88) = 8;
+            *reinterpret_cast<uint32_t*>(hdr + 92) = 0xFF;
+            break;
+        case D3DFMT_A8:
+            flags |= 0x8;
+            *reinterpret_cast<uint32_t*>(hdr + 20) = w;
+            *reinterpret_cast<uint32_t*>(hdr + 80) = 0x2;        // DDPF_ALPHA
+            *reinterpret_cast<uint32_t*>(hdr + 88) = 8;
+            *reinterpret_cast<uint32_t*>(hdr + 104) = 0xFF;
+            break;
+        default:
+            return; // unsupported format
+    }
+
+    *reinterpret_cast<uint32_t*>(hdr + 8) = flags;
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return;
+
+    f.write(reinterpret_cast<const char*>(hdr), 128);
+    const uint8_t* src = static_cast<const uint8_t*>(pBits);
+    for (UINT row = 0; row < rowCount; row++)
+        f.write(reinterpret_cast<const char*>(src + (size_t)row * pitch), rowPitch);
+
+    spdlog::debug("HDTextures: dumped {:016x} {}x{} fmt={}", hash, w, h, (int)fmt);
+}
+#endif // HDTEX_DUMP_TEXTURES

@@ -602,6 +602,10 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
 #ifdef HDTEX_DUMP_SHADERS
         spdlog::info("HDTextures: shader dump enabled -> shader_dumps\\");
 #endif
+#ifdef HDTEX_DUMP_TEXTURES
+        HDTextureReplacer::SetDumpDir(dllDir + L"\\texture_dumps");
+        spdlog::info("HDTextures: texture dump enabled -> texture_dumps\\");
+#endif
 
 #ifndef HDTEX_DIAG_NO_CONSTRUCT
         try {
