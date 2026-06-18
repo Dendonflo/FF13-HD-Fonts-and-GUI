@@ -2,7 +2,6 @@
 
 #include <string>
 #include <vector>
-#include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
@@ -15,196 +14,101 @@
 #include "spdlog/spdlog.h"
 
 // Runtime HD texture replacement for FF XIII via content hashing.
-// Covers fonts, GUI elements, map tiles, and shop artwork.
-//
-// This system identifies textures by hashing their pixel data at runtime
-// and looking up the hash in a pre-computed database.
 //
 // Flow:
-//   1. At startup, load hash_database.txt (hash -> texture name)
-//   2. Scan hd_textures/ folder for HD DDS replacement files
-//      - Static namespaces (gui_resident, etc.): pixel data loaded into RAM immediately
-//      - Lazy-loaded numbered namespaces (e.g. map_scene): path indexed, pixel data
-//        loaded from disk on first access and discarded on flush
-//   3. On first SetTexture for each texture, lock it read-only, hash pixels,
-//      look up name in database
-//   4. If HD replacement exists for that name, create HD texture and swap
-//   5. On numbered group change (scene/shop number change): flush old group's
-//      HD textures and tracking entries from memory
+//   1. Init(): load hash_database.txt (hash -> name) and scan hd_textures/
+//      subdirs to record DDS paths on disk (lazyPaths). No pixel data loaded.
+//   2. OnSetTexture(): on first bind of an original texture, hash its pixels,
+//      look up the name, read the DDS from disk, upload to GPU, free the pixel
+//      buffer. Subsequent binds of the same pointer hit the fast-path cache.
+//   3. OnOriginalReleased(): called when the game's Release refcount hits zero.
+//      Drops pointer caches; when the last original referencing an HD texture
+//      is gone (nameRefs -> 0), the GPU texture is released immediately.
 //
-// Ownership:
-//   nameToHDTex owns ALL live HD textures (static and numbered alike).
-//   textureMap is a non-owning pointer-keyed fast-path cache for all textures.
-//   Static textures are in nameToHDTex but never in any group LRU (never evicted).
-//   Numbered textures are in nameToHDTex and their group's LRU (evicted normally).
+// Ownership: nameToHDTex is sole owner of all live HD textures.
+//            textureMap is a non-owning fast-path pointer -> HD texture cache.
 //
-// Format-agnostic: works with DXT1, DXT5, etc.
+// Thread safety: all public methods must be called under g_hdTexCS.
 class HDTextureReplacer
 {
 public:
-    // modDir: directory containing d3d9.dll (white_data\prog\win\bin\).
-    // Reads hd_textures\lazyload_config.txt for lazy-load prefixes,
-    // and hd_textures\hash_database.txt for the hash → name mapping.
+    // modDir: directory containing version.dll.
+    // Reads hd_textures\hash_database.txt and scans hd_textures\ subdirs.
     void Init(const std::wstring& modDir);
+
     // Called from SetTexture hook — identifies texture by hash, swaps if HD available.
-    // Needs device pointer to create HD textures on first match.
     IDirect3DBaseTexture9* OnSetTexture(IDirect3DDevice9* pDevice,
                                         IDirect3DBaseTexture9* pTexture);
 
+    // Called on device Reset — releases all GPU-side HD textures.
     void ReleaseTextures();
 
     // Called from CreateTexture hook — evicts stale cache entries for reused pointers.
     void InvalidateTexture(IDirect3DBaseTexture9* pTexture);
 
-#ifdef HDTEX_RELEASE_TRACKING
     // Called from the IDirect3DTexture9::Release vtable hook when an original
-    // game texture's refcount reaches zero. Drops all cache entries for that
-    // pointer and, once the last pointer referencing a given HD texture is gone,
-    // releases the HD GPU texture (and frees lazy pixel data). This replaces the
-    // LRU/group-flush machinery: VRAM is reclaimed exactly when the game frees
-    // its own original, with no scene-number heuristics or VRAM caps.
+    // game texture's refcount reaches zero. Releases the HD counterpart when
+    // no other original still references it (nameRefs hits 0).
     void OnOriginalReleased(IDirect3DBaseTexture9* pTexture);
-#endif
 
-    // Called from the CostumeTracker callback (under g_hdTexCS) to swap the pixel
-    // data for one gui_resident face texture without a full reload.
-    // Releases the existing GPU texture for texName so it will be re-uploaded on the
-    // next SetTexture call that references it. Leaves the original-pointer caches
-    // intact — they are invalidated naturally when the game re-binds the texture.
+    // Hot-swap pixel data for one named texture without a full reload.
+    // Used by the costume tracking system to swap face artwork at runtime.
+    // The existing GPU texture is released and will be re-uploaded on the next bind.
     void SwapCostumeTexture(const std::string& texName,
                             UINT hdW, UINT hdH, D3DFORMAT format,
                             std::vector<uint8_t> pixels);
 
-    // Parse DDS header + pixel data from disk. Public so dllmain's costume callback
-    // can call it outside the critical section before entering to do the swap.
+    // Parse DDS header + pixel data from disk.
+    // Public so the costume callback can call it outside g_hdTexCS.
     static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                         D3DFORMAT& format, std::vector<uint8_t>& pixelData);
 
 #ifdef HDTEX_HOT_RELOAD
-    // Release all GPU textures and pixel data, then re-read DDS files from disk.
-    // Called periodically by the hot-reload background thread so in-progress texture
-    // edits become visible in-game without a restart.
     void HotReload();
 #endif
 
 private:
-    struct HDTextureData {
-        UINT hdW, hdH;
-        D3DFORMAT format;
-        std::vector<uint8_t> pixelData;
-    };
-
-    // Per-numbered-namespace group: owns its LRU state and current active number.
-    // All numbered namespaces sharing the same prefix (e.g. "map_scene") form one group;
-    // the group tracks which suffix (e.g. "00023") is currently active.
-    struct NumberedGroup {
-        std::string currentNumber;   // active numeric suffix, e.g. "00023" or "02"
-        std::list<std::string>                            lruOrder;
-        std::unordered_map<std::string,
-            std::list<std::string>::iterator>             lruIndex;
-        size_t lruCap = 0;           // 0 = not yet initialised; set on first encounter
-    };
-
-    // Pre-computed hash -> texture name
+    // hash -> texture name (read once at Init, never modified)
     std::unordered_map<uint64_t, std::string> hashDB;
 
-    // name -> HD replacement data
-    // Populated at startup for static + preloaded-numbered namespaces;
-    // populated on demand for lazy-loaded namespaces (map scenes).
-    std::unordered_map<std::string, HDTextureData> hdData;
-
-    // original texture pointer -> HD texture (non-owning fast-path for ALL textures).
-    // nameToHDTex is the sole owner; textureMap is just a pointer-keyed lookup cache.
-    std::unordered_map<IDirect3DBaseTexture9*, IDirect3DTexture9*> textureMap;
-
-    // Textures already checked (no match or already mapped)
-    std::unordered_set<IDirect3DBaseTexture9*> checkedTextures;
-
-    // game pointer -> texture key ("namespace/name")
-    std::unordered_map<IDirect3DBaseTexture9*, std::string> pointerKey;
-
-    // Disk paths for lazy-loaded tiles
-    // key -> full DDS path on disk.
+    // texture name -> DDS path on disk (populated at Init by scanning hd_textures\)
     std::unordered_map<std::string, std::wstring> lazyPaths;
 
-    // Set of namespace prefixes (digits stripped) that are lazy-loaded from disk.
-    // Populated at Init() from hd_textures/lazyload_config.txt.
-    std::unordered_set<std::string> lazyPrefixes;
-
-    // Per-prefix VRAM LRU cap, read from lazyload_config.txt.
-    // Falls back to LruCapDefault() if no entry for the prefix.
-    std::unordered_map<std::string, size_t> lazyLruCaps;
-
-    // Texture name -> live D3D9 texture (sole owner for ALL textures, static and numbered).
-    // Static textures live here forever (until ReleaseTextures); numbered tiles are also
-    // managed by their group's LRU and released on eviction or flush.
+    // texture name -> live GPU texture (sole owner)
     std::unordered_map<std::string, IDirect3DTexture9*> nameToHDTex;
 
-    // Active numbered groups, keyed by prefix (e.g. "map_scene", "shop_").
-    // Each group owns its LRU and tracks its current active number.
-    std::unordered_map<std::string, NumberedGroup> numberedGroups;
+    // original D3D pointer -> HD texture (non-owning fast-path cache)
+    std::unordered_map<IDirect3DBaseTexture9*, IDirect3DTexture9*> textureMap;
 
-#ifdef HDTEX_RELEASE_TRACKING
-    // Live original-pointer count per HD texture name. While > 0 the HD texture
-    // stays resident; when it hits 0 (last original released) the HD texture is
-    // released. Lets several game pointers — the same logical texture reloaded at
-    // new addresses — share one HD texture without premature free or thrash.
+    // original D3D pointer -> texture name (needed by OnOriginalReleased)
+    std::unordered_map<IDirect3DBaseTexture9*, std::string> pointerKey;
+
+    // pointers already checked with no match (avoid rehashing every bind)
+    std::unordered_set<IDirect3DBaseTexture9*> checkedTextures;
+
+    // live original-pointer count per HD texture name.
+    // HD texture is kept resident while > 0; released when it hits 0.
     std::unordered_map<std::string, int> nameRefs;
 
-    // Release the HD GPU texture for a name, drop it from any group LRU, and free
-    // its lazy pixel data (static pixel data is kept). Called when nameRefs hits 0.
-    void ReleaseHDByName(const std::string& name);
-#endif
+    // costume pixel data pending GPU upload (set by SwapCostumeTexture,
+    // consumed and freed by CreateHDTextureFromData on next bind)
+    struct PendingSwap { UINT w, h; D3DFORMAT fmt; std::vector<uint8_t> pixels; };
+    std::unordered_map<std::string, PendingSwap> pendingSwaps;
 
-    // Root path of hd_textures\ — stored so HotReload() can re-scan without re-running Init().
     std::wstring m_hdRoot;
 
-    // -----------------------------------------------------------------------
-    // Namespace classification helpers
-    // -----------------------------------------------------------------------
-
-    // Returns true if ns is a numbered namespace:
-    //   "…scene[0-9]+"  e.g. "map_scene00023", "gui_scene00004"
-    //   "…_[0-9]+"      e.g. "shop_02", "foo_01"
-    static bool IsNumberedNamespace(const std::string& ns);
-
-    // Returns true if the key's namespace is numbered.
-    static bool IsNumberedTile(const std::string& key);
-
-    // Split a numbered namespace into (prefix, number).
-    //   "map_scene00023" -> {"map_scene", "00023"}
-    //   "shop_02"        -> {"shop_",     "02"}
-    static std::pair<std::string, std::string>
-        SplitNumberedNamespace(const std::string& ns);
-
-    // Returns true if tiles in this namespace should be lazy-loaded from disk.
-    // ns may be a full namespace ("map_scene00023") or bare prefix ("map_scene") —
-    // trailing digits are stripped before checking against lazyPrefixes.
-    bool ShouldLazyLoad(const std::string& ns) const;
-
-    // VRAM LRU cap for a given prefix.
-    // Checks lazyLruCaps first; falls back to a heuristic default.
-    size_t LruCapForPrefix(const std::string& prefix) const;
-
-    // -----------------------------------------------------------------------
-    // Core operations
-    // -----------------------------------------------------------------------
-
-    // Upload HD pixel data and return a new D3D9 texture (caller owns it).
+    // Read DDS from disk and upload to GPU. Returns new texture (caller registers
+    // in nameToHDTex) or nullptr on failure. Pixel buffer is freed after upload.
     IDirect3DTexture9* CreateHDTexture(IDirect3DDevice9* pDevice,
                                        const std::string& texName);
 
-    // Release all HD textures and tracking entries belonging to the currently
-    // active namespace of a group (prefix + group.currentNumber).
-    // Frees lazy-loaded pixel data from hdData; keeps preloaded pixel data.
-    void FlushGroup(const std::string& prefix, NumberedGroup& group);
+    // Upload from a caller-supplied pixel buffer (used by costume swap path).
+    IDirect3DTexture9* CreateHDTextureFromData(IDirect3DDevice9* pDevice,
+                                               UINT w, UINT h, D3DFORMAT fmt,
+                                               std::vector<uint8_t>& pixels);
 
-    // Evict the least-recently-used tile from a group to reclaim VRAM.
-    void EvictOldest(const std::string& prefix, NumberedGroup& group);
-
-    void ScanHDSubdir(const std::wstring& subDirPath, const std::string& prefix);
+    void ScanHDSubdir(const std::wstring& subDirPath, const std::string& ns);
     void RescanDisk();
-    void LoadLazyConfig();
     bool LoadHashDB();
 
     static uint64_t FNV1a64(const uint8_t* data, size_t len,
@@ -275,53 +179,9 @@ inline UINT HDTextureReplacer::ComputeRowCount(D3DFORMAT format, UINT height)
 
 
 // -----------------------------------------------------------------------
-// Namespace classification
+// Init — load hash database + scan hd_textures/ subdirectories for DDS paths
 // -----------------------------------------------------------------------
 
-inline bool HDTextureReplacer::IsNumberedNamespace(const std::string& ns)
-{
-    if (ns.empty()) return false;
-    size_t i = ns.size();
-    while (i > 0 && std::isdigit((unsigned char)ns[i - 1])) --i;
-    return i < ns.size(); // true if at least one trailing digit exists
-}
-
-inline bool HDTextureReplacer::IsNumberedTile(const std::string& key)
-{
-    auto slash = key.find('/');
-    if (slash == std::string::npos) return false;
-    return IsNumberedNamespace(key.substr(0, slash));
-}
-
-inline std::pair<std::string, std::string>
-HDTextureReplacer::SplitNumberedNamespace(const std::string& ns)
-{
-    size_t i = ns.size();
-    while (i > 0 && std::isdigit((unsigned char)ns[i - 1])) --i;
-    return { ns.substr(0, i), ns.substr(i) };
-}
-
-inline bool HDTextureReplacer::ShouldLazyLoad(const std::string& ns) const
-{
-    // ns may be a full namespace ("map_scene00023") or a bare prefix ("map_scene").
-    // Strip trailing digits before checking — the set stores prefixes only.
-    return lazyPrefixes.count(SplitNumberedNamespace(ns).first) > 0;
-}
-
-inline size_t HDTextureReplacer::LruCapForPrefix(const std::string& prefix) const
-{
-    auto it = lazyLruCaps.find(prefix);
-    if (it != lazyLruCaps.end()) return it->second;
-    // Heuristic fallback: map scenes have up to 63 tiles, 128 is comfortable headroom.
-    if (prefix.size() >= 5 && prefix.substr(prefix.size() - 5) == "scene")
-        return 128;
-    return 32;
-}
-
-
-// -----------------------------------------------------------------------
-// Init — load hash database + scan hd_textures/ subdirectories
-// -----------------------------------------------------------------------
 static std::string StripDDSExtension(const std::string& fname)
 {
     size_t pos = fname.find(".txbh.dds");
@@ -332,16 +192,13 @@ static std::string StripDDSExtension(const std::string& fname)
 }
 
 inline void HDTextureReplacer::ScanHDSubdir(const std::wstring& subDirPath,
-                                             const std::string& prefix)
+                                             const std::string& ns)
 {
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW((subDirPath + L"\\*.dds").c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
-    const bool isNumbered = IsNumberedNamespace(prefix);
-    const bool lazy       = isNumbered && ShouldLazyLoad(prefix);
     int count = 0;
-
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -349,45 +206,20 @@ inline void HDTextureReplacer::ScanHDSubdir(const std::wstring& subDirPath,
         std::wstring filePath = subDirPath + L"\\" + fd.cFileName;
         std::wstring fnameW   = fd.cFileName;
         std::string  fname(fnameW.begin(), fnameW.end());
-        std::string  key = prefix + "/" + StripDDSExtension(fname);
+        std::string  key = ns + "/" + StripDDSExtension(fname);
 
-        if (lazy)
-        {
-            // Map scene tile: record path only — pixel data loaded on first access.
-            lazyPaths[key] = filePath;
-        }
-        else
-        {
-            // Static or preloaded-numbered (shops): load pixel data into RAM now.
-            UINT hdW, hdH;
-            D3DFORMAT format;
-            std::vector<uint8_t> pixels;
-            if (!ReadDDS(filePath, hdW, hdH, format, pixels)) continue;
-
-            HDTextureData hd;
-            hd.hdW = hdW; hd.hdH = hdH;
-            hd.format = format;
-            hd.pixelData = std::move(pixels);
-
-            spdlog::debug("HDTextures: HD texture '{}' loaded ({}x{}, {} bytes)",
-                          key, hdW, hdH, hd.pixelData.size());
-            hdData[key] = std::move(hd);
-        }
+        lazyPaths[key] = filePath;
         ++count;
 
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
 
-    if (lazy)
-        spdlog::info("HDTextures: map scene '{}': {} tile(s) indexed for lazy load",
-                     prefix, count);
+    spdlog::debug("HDTextures: indexed {} DDS path(s) in '{}'", count, ns);
 }
 
 inline void HDTextureReplacer::Init(const std::wstring& modDir)
 {
     m_hdRoot = modDir + L"\\hd_textures";
-
-    LoadLazyConfig();
 
     if (!LoadHashDB())
         return;
@@ -401,66 +233,11 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
 
     RescanDisk();
 
-    if (!hdData.empty())
-        spdlog::info("HDTextures: {} HD texture(s) available for replacement", hdData.size());
+    spdlog::info("HDTextures: {} hash(es), {} HD path(s) indexed",
+                 hashDB.size(), lazyPaths.size());
 }
 
 
-// -----------------------------------------------------------------------
-// LoadLazyConfig — read hd_textures\lazyload_config.txt into lazyPrefixes +
-// lazyLruCaps. Safe to call on an already-populated instance; simply adds new
-// entries (call site should clear first for a full hot reload).
-// -----------------------------------------------------------------------
-inline void HDTextureReplacer::LoadLazyConfig()
-{
-    std::wstring cfgPath = m_hdRoot + L"\\lazyload_config.txt";
-    std::ifstream cfg(cfgPath);
-    if (!cfg.is_open())
-    {
-        spdlog::info("HDTextures: no lazyload_config.txt found, all namespaces preloaded");
-        return;
-    }
-
-    std::string line;
-    while (std::getline(cfg, line))
-    {
-        // Strip carriage return (Windows line endings)
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        // Strip inline comment
-        auto hash = line.find('#');
-        if (hash != std::string::npos) line = line.substr(0, hash);
-
-        std::istringstream iss(line);
-        std::string prefix;
-        if (!(iss >> prefix)) continue;
-
-        lazyPrefixes.insert(prefix);
-
-        size_t cap;
-        if (iss >> cap)
-            lazyLruCaps[prefix] = cap;
-    }
-
-    if (!lazyPrefixes.empty())
-    {
-        std::string joined;
-        for (auto& p : lazyPrefixes)
-        {
-            auto capIt = lazyLruCaps.find(p);
-            std::string entry = p;
-            if (capIt != lazyLruCaps.end())
-                entry += "(cap=" + std::to_string(capIt->second) + ")";
-            joined += (joined.empty() ? "" : ", ") + entry;
-        }
-        spdlog::info("HDTextures: lazy-load prefixes: {}", joined);
-    }
-}
-
-
-// -----------------------------------------------------------------------
-// LoadHashDB — read hd_textures\hash_database.txt into hashDB.
-// Returns false if the file is absent (texture replacement stays disabled).
-// -----------------------------------------------------------------------
 inline bool HDTextureReplacer::LoadHashDB()
 {
     std::wstring hashDBPath = m_hdRoot + L"\\hash_database.txt";
@@ -489,11 +266,6 @@ inline bool HDTextureReplacer::LoadHashDB()
 }
 
 
-// -----------------------------------------------------------------------
-// RescanDisk — iterate hd_textures\ subdirs and call ScanHDSubdir for each.
-// Safe to call multiple times: ScanHDSubdir overwrites existing hdData/lazyPaths
-// entries, so the result is always up-to-date with disk.
-// -----------------------------------------------------------------------
 inline void HDTextureReplacer::RescanDisk()
 {
     if (m_hdRoot.empty()) return;
@@ -519,42 +291,26 @@ inline void HDTextureReplacer::RescanDisk()
 
 
 #ifdef HDTEX_HOT_RELOAD
-// -----------------------------------------------------------------------
-// HotReload — flush all caches and pixel data, then re-read DDS files from disk.
-// Called under g_hdTexCS by the hot-reload background thread.
-// -----------------------------------------------------------------------
 inline void HDTextureReplacer::HotReload()
 {
-    // Release all GPU-side HD textures (nameToHDTex is sole owner).
     for (auto& [name, tex] : nameToHDTex)
         if (tex) tex->Release();
     nameToHDTex.clear();
 
-    // Clear runtime pointer caches (non-owning, no Release needed).
     textureMap.clear();
     checkedTextures.clear();
     pointerKey.clear();
-    numberedGroups.clear();
-#ifdef HDTEX_RELEASE_TRACKING
     nameRefs.clear();
-#endif
+    pendingSwaps.clear();
 
-    // Drop all pixel data and lazy paths so RescanDisk reads fresh bytes.
-    hdData.clear();
+    hashDB.clear();
     lazyPaths.clear();
 
-    // Drop config maps so the re-read picks up any edits to the txt files.
-    hashDB.clear();
-    lazyPrefixes.clear();
-    lazyLruCaps.clear();
-
-    // Re-read everything from disk — config first, then texture assets.
-    LoadLazyConfig();
     LoadHashDB();
     RescanDisk();
 
-    spdlog::info("HDTextures: hot reload complete ({} hash(es), {} static texture(s) resident)",
-                 hashDB.size(), hdData.size());
+    spdlog::info("HDTextures: hot reload complete ({} hash(es), {} path(s) indexed)",
+                 hashDB.size(), lazyPaths.size());
 }
 #endif
 
@@ -567,12 +323,12 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
 {
     if (!pTexture || hashDB.empty()) return pTexture;
 
-    // Fast path: already mapped to an HD texture.
+    // Fast path: already mapped.
     auto mapIt = textureMap.find(pTexture);
     if (mapIt != textureMap.end())
         return mapIt->second;
 
-    // Already checked with no match — skip.
+    // Already checked with no match.
     if (checkedTextures.count(pTexture))
         return pTexture;
 
@@ -601,6 +357,11 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
     for (UINT row = 0; row < rowCount; row++)
         h = FNV1a64(bits + row * locked.Pitch, rowPitch, h);
 
+#ifdef HDTEX_DUMP_TEXTURES
+    DumpTextureDDS(h, desc.Format, desc.Width, desc.Height,
+                   locked.pBits, locked.Pitch, rowPitch, rowCount);
+#endif
+
     tex->UnlockRect(0);
 
     auto dbIt = hashDB.find(h);
@@ -609,86 +370,15 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
 
     const std::string& texName = dbIt->second;
 
-    // Track the prefix so we can manage the right group, without splitting twice.
-    std::string numberedPrefix;
-
-    if (IsNumberedTile(texName))
-    {
-        const std::string ns = texName.substr(0, texName.find('/'));
-        auto [pfx, num] = SplitNumberedNamespace(ns);
-        numberedPrefix = pfx;
-
-        // Initialise group on first encounter.
-        auto& group = numberedGroups[pfx];
-        if (group.lruCap == 0)
-            group.lruCap = LruCapForPrefix(pfx);
-
-#ifndef HDTEX_RELEASE_TRACKING
-        // Flush the old namespace when the active number changes.
-        // With release tracking, old tiles are freed when the game releases
-        // them, so this scene-switch heuristic is unnecessary.
-        if (!group.currentNumber.empty() && group.currentNumber != num)
-        {
-            spdlog::debug("HDTextures: numbered group switching '{}{}' -> '{}{}'",
-                          pfx, group.currentNumber, pfx, num);
-            FlushGroup(pfx, group);
-        }
-#endif
-        group.currentNumber = num;
-    }
-
-    // Check nameToHDTex for ALL textures — static and numbered alike.
-    // If the HD texture is already resident (e.g. game reloaded at a new address),
-    // reuse it — no disk read, no GPU upload.
+    // If already resident (e.g. game reloaded same texture at new address), reuse.
     {
         auto nameIt = nameToHDTex.find(texName);
         if (nameIt != nameToHDTex.end())
         {
-#ifndef HDTEX_RELEASE_TRACKING
-            // Touch LRU for numbered tiles.
-            if (!numberedPrefix.empty())
-            {
-                auto& group = numberedGroups[numberedPrefix];
-                auto lruIt = group.lruIndex.find(texName);
-                if (lruIt != group.lruIndex.end())
-                {
-                    group.lruOrder.erase(lruIt->second);
-                    group.lruOrder.push_front(texName);
-                    group.lruIndex[texName] = group.lruOrder.begin();
-                }
-            }
-#endif
-
-            textureMap[pTexture] = nameIt->second;   // non-owning fast-path
+            textureMap[pTexture] = nameIt->second;
             pointerKey[pTexture] = texName;
-#ifdef HDTEX_RELEASE_TRACKING
-            // New original pointer referencing this HD texture.
             nameRefs[texName]++;
-#endif
             return nameIt->second;
-        }
-    }
-
-    // Not yet resident: lazy-load pixel data from disk for lazy-loaded numbered namespaces.
-    // Preloaded namespaces (shops) and static namespaces already have data in hdData.
-    if (!numberedPrefix.empty() && hdData.find(texName) == hdData.end())
-    {
-        auto pathIt = lazyPaths.find(texName);
-        if (pathIt != lazyPaths.end())
-        {
-            UINT hdW, hdH;
-            D3DFORMAT format;
-            std::vector<uint8_t> pixels;
-            if (ReadDDS(pathIt->second, hdW, hdH, format, pixels))
-            {
-                HDTextureData hd;
-                hd.hdW = hdW; hd.hdH = hdH;
-                hd.format = format;
-                hd.pixelData = std::move(pixels);
-                spdlog::debug("HDTextures: lazy-loaded map tile '{}' ({}x{})",
-                              texName, hdW, hdH);
-                hdData[texName] = std::move(hd);
-            }
         }
     }
 
@@ -696,129 +386,67 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
     if (!hdTex)
         return pTexture;
 
-    // nameToHDTex owns ALL HD textures — static and numbered alike.
     nameToHDTex[texName] = hdTex;
-    textureMap[pTexture]  = hdTex;   // non-owning fast-path
+    textureMap[pTexture]  = hdTex;
     pointerKey[pTexture]  = texName;
+    nameRefs[texName]     = 1;
 
-#ifdef HDTEX_RELEASE_TRACKING
-    // First original pointer referencing this freshly created HD texture.
-    nameRefs[texName]++;
-#else
-    // Numbered tiles: register in group LRU and evict if over cap.
-    if (!numberedPrefix.empty())
-    {
-        auto& group = numberedGroups[numberedPrefix];
-        group.lruOrder.push_front(texName);
-        group.lruIndex[texName] = group.lruOrder.begin();
-
-        while (group.lruOrder.size() > group.lruCap)
-            EvictOldest(numberedPrefix, group);
-    }
-#endif
-
-    spdlog::debug("HDTextures: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
-                  texName, h, desc.Width, desc.Height,
-                  hdData.at(texName).hdW, hdData.at(texName).hdH);
+    spdlog::debug("HDTextures: '{}' matched by hash {:016x}, swapped to HD",
+                  texName, h);
 
     return hdTex;
 }
 
 
 // -----------------------------------------------------------------------
-// ReleaseTextures — called on device reset; release all D3D9 objects
+// ReleaseTextures — called on device Reset
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::ReleaseTextures()
 {
-    // nameToHDTex owns ALL HD textures (static and numbered) — release all here.
     for (auto& [name, tex] : nameToHDTex)
         if (tex) tex->Release();
     nameToHDTex.clear();
 
-    // textureMap is non-owning — just clear, no Release.
     textureMap.clear();
-
-    // Reset per-group LRU state. Keep groups and their caps registered
-    // so they are ready immediately after device reset without re-init.
-    for (auto& [pfx, group] : numberedGroups)
-    {
-        group.lruOrder.clear();
-        group.lruIndex.clear();
-        group.currentNumber.clear();
-    }
-
     checkedTextures.clear();
     pointerKey.clear();
-
-#ifdef HDTEX_RELEASE_TRACKING
     nameRefs.clear();
-#endif
-
-    // Free lazily-loaded pixel data (map scenes).
-    // Preloaded pixel data (shops, gui_resident) is kept — it came from Init().
-    for (auto it = hdData.begin(); it != hdData.end(); )
-        it = lazyPaths.count(it->first) ? hdData.erase(it) : std::next(it);
+    pendingSwaps.clear();
 }
 
 
 // -----------------------------------------------------------------------
-// InvalidateTexture — evict stale entries when a D3D9 pointer is reused
+// InvalidateTexture — pointer reused by a new CreateTexture call
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::InvalidateTexture(IDirect3DBaseTexture9* pTexture)
 {
-#ifdef HDTEX_RELEASE_TRACKING
-    // A reused pointer means the previous object at this address was freed.
-    // Treat it exactly like a release: drop the caches and decref the HD texture.
-    // (With the Release hook installed this is usually a no-op — the hook already
-    //  ran on the real free — but it keeps accounting correct if the hook missed.)
+    // Treat the same as a release: the old object at this address is gone.
+    // OnOriginalReleased is idempotent if the Release hook already ran.
     OnOriginalReleased(pTexture);
-#else
-    // textureMap is non-owning for ALL textures — just remove the entry, no Release.
-    // nameToHDTex remains the owner; the HD texture stays resident for future reuse.
-    textureMap.erase(pTexture);
-    checkedTextures.erase(pTexture);
-    pointerKey.erase(pTexture);
-#endif
 }
 
 
-#ifdef HDTEX_RELEASE_TRACKING
 // -----------------------------------------------------------------------
-// OnOriginalReleased — an original game texture's refcount hit zero.
-// Drop its caches; when the last original referencing an HD texture is gone,
-// release the HD texture. Must be called under g_hdTexCS.
+// OnOriginalReleased — original game texture freed, release HD if last ref
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::OnOriginalReleased(IDirect3DBaseTexture9* pTexture)
 {
-    // Always drop the cheap caches (covers the no-match case too, which keeps
-    // checkedTextures from growing without bound over a long session).
     textureMap.erase(pTexture);
     checkedTextures.erase(pTexture);
 
     auto it = pointerKey.find(pTexture);
     if (it == pointerKey.end())
-        return;   // not one of ours (or already cleaned up)
+        return;
 
     const std::string name = it->second;
     pointerKey.erase(it);
 
     auto rc = nameRefs.find(name);
-    if (rc == nameRefs.end())
+    if (rc == nameRefs.end() || --rc->second > 0)
         return;
-    if (--rc->second > 0)
-        return;   // other originals still reference this HD texture
 
     nameRefs.erase(rc);
-    ReleaseHDByName(name);
-}
 
-
-// -----------------------------------------------------------------------
-// ReleaseHDByName — release the HD GPU texture for a name and free its lazy
-// pixel data. Static pixel data (gui_resident, fonts, shops) is kept resident.
-// -----------------------------------------------------------------------
-inline void HDTextureReplacer::ReleaseHDByName(const std::string& name)
-{
     auto nit = nameToHDTex.find(name);
     if (nit != nameToHDTex.end())
     {
@@ -826,199 +454,149 @@ inline void HDTextureReplacer::ReleaseHDByName(const std::string& name)
         nameToHDTex.erase(nit);
     }
 
-    // Free lazy-loaded pixel data so RAM tracks what is actually in use.
-    // Preloaded/static pixel data stays so it never needs a disk re-read.
-    if (lazyPaths.count(name))
-        hdData.erase(name);
-
     spdlog::debug("HDTextures: released HD '{}' (last original freed)", name);
 }
-#endif // HDTEX_RELEASE_TRACKING
 
 
 // -----------------------------------------------------------------------
-// FlushGroup — release all HD textures for a group's current namespace
-// -----------------------------------------------------------------------
-inline void HDTextureReplacer::FlushGroup(const std::string& prefix, NumberedGroup& group)
-{
-    if (group.currentNumber.empty()) return;
-
-    // Build the namespace prefix used to identify tiles belonging to this group.
-    // e.g. prefix="map_scene", currentNumber="00023" -> "map_scene00023/"
-    const std::string nsPrefix = prefix + group.currentNumber + "/";
-
-    // Release HD textures (nameToHDTex is owner for all numbered tiles).
-    std::vector<std::string> toRelease;
-    for (auto& [name, tex] : nameToHDTex)
-    {
-        if (name.size() >= nsPrefix.size() &&
-            name.compare(0, nsPrefix.size(), nsPrefix) == 0)
-        {
-            if (tex) tex->Release();
-            toRelease.push_back(name);
-        }
-    }
-    for (auto& name : toRelease)
-    {
-        nameToHDTex.erase(name);
-
-        auto lruIt = group.lruIndex.find(name);
-        if (lruIt != group.lruIndex.end())
-        {
-            group.lruOrder.erase(lruIt->second);
-            group.lruIndex.erase(lruIt);
-        }
-
-        // Free pixel data only for lazy-loaded tiles (map scenes).
-        // Preloaded pixel data (shops) stays in hdData permanently.
-        if (lazyPaths.count(name))
-            hdData.erase(name);
-    }
-
-    // Clean up pointer tracking entries (non-owning for numbered tiles, no Release).
-    std::vector<IDirect3DBaseTexture9*> ptrsToRemove;
-    for (auto& [ptr, key] : pointerKey)
-    {
-        if (key.size() >= nsPrefix.size() &&
-            key.compare(0, nsPrefix.size(), nsPrefix) == 0)
-            ptrsToRemove.push_back(ptr);
-    }
-    for (auto ptr : ptrsToRemove)
-    {
-        textureMap.erase(ptr);
-        checkedTextures.erase(ptr);
-        pointerKey.erase(ptr);
-    }
-
-    spdlog::debug("HDTextures: flushed '{}{}' ({} HD texture(s), {} pointer(s) removed)",
-                  prefix, group.currentNumber, toRelease.size(), ptrsToRemove.size());
-}
-
-
-// -----------------------------------------------------------------------
-// EvictOldest — evict least-recently-used tile from a group to free VRAM
-// -----------------------------------------------------------------------
-inline void HDTextureReplacer::EvictOldest(const std::string& prefix, NumberedGroup& group)
-{
-    if (group.lruOrder.empty()) return;
-
-    const std::string name = group.lruOrder.back();
-    group.lruOrder.pop_back();
-    group.lruIndex.erase(name);
-
-    // Release the HD texture (nameToHDTex is owner).
-    auto hdTexIt = nameToHDTex.find(name);
-    if (hdTexIt != nameToHDTex.end())
-    {
-        if (hdTexIt->second) hdTexIt->second->Release();
-        nameToHDTex.erase(hdTexIt);
-    }
-
-    // Remove all pointer tracking entries for this tile (non-owning, no Release).
-    std::vector<IDirect3DBaseTexture9*> toRemove;
-    for (auto& [ptr, key] : pointerKey)
-        if (key == name) toRemove.push_back(ptr);
-
-    for (auto ptr : toRemove)
-    {
-        textureMap.erase(ptr);
-        checkedTextures.erase(ptr);
-        pointerKey.erase(ptr);
-    }
-
-    // Pixel data kept in hdData:
-    //   - Lazy tiles (maps): allows fast VRAM recreation without a disk read if revisited.
-    //   - Preloaded tiles (shops): already permanently resident, nothing to do.
-    spdlog::debug("HDTextures: LRU evicted '{}' from '{}' ({} pointer(s) removed)",
-                  name, prefix, toRemove.size());
-}
-
-
-// -----------------------------------------------------------------------
-// CreateHDTexture — upload pixel data to VRAM, return new D3D9 texture
+// CreateHDTexture — read DDS from disk, upload to GPU, free pixel buffer
 // -----------------------------------------------------------------------
 inline IDirect3DTexture9* HDTextureReplacer::CreateHDTexture(IDirect3DDevice9* pDevice,
                                                               const std::string& texName)
 {
-    auto hdIt = hdData.find(texName);
-    if (hdIt == hdData.end()) return nullptr;
-    const HDTextureData& hd = hdIt->second;
-
-    IDirect3DTexture9* hdTex = nullptr;
-    HRESULT hr = pDevice->CreateTexture(hd.hdW, hd.hdH, 1, 0,
-                                        hd.format, D3DPOOL_MANAGED,
-                                        &hdTex, nullptr);
-    if (FAILED(hr))
+    // Check for a pending costume swap first.
+    auto swapIt = pendingSwaps.find(texName);
+    if (swapIt != pendingSwaps.end())
     {
-        spdlog::error("HDTextures: failed to create HD texture for '{}' (hr=0x{:08X})",
-                      texName, (unsigned)hr);
+        auto& s = swapIt->second;
+        IDirect3DTexture9* t = CreateHDTextureFromData(pDevice, s.w, s.h, s.fmt, s.pixels);
+        pendingSwaps.erase(swapIt);
+        return t;
+    }
+
+    auto pathIt = lazyPaths.find(texName);
+    if (pathIt == lazyPaths.end())
+        return nullptr;
+
+    UINT hdW, hdH;
+    D3DFORMAT format;
+    std::vector<uint8_t> pixels;
+    if (!ReadDDS(pathIt->second, hdW, hdH, format, pixels))
+    {
+        spdlog::warn("HDTextures: failed to read DDS for '{}'", texName);
         return nullptr;
     }
 
-    D3DLOCKED_RECT hdLocked;
-    hr = hdTex->LockRect(0, &hdLocked, nullptr, 0);
+    return CreateHDTextureFromData(pDevice, hdW, hdH, format, pixels);
+}
+
+
+inline IDirect3DTexture9* HDTextureReplacer::CreateHDTextureFromData(
+    IDirect3DDevice9* pDevice, UINT w, UINT h, D3DFORMAT fmt,
+    std::vector<uint8_t>& pixels)
+{
+    IDirect3DTexture9* hdTex = nullptr;
+    HRESULT hr = pDevice->CreateTexture(w, h, 1, 0, fmt, D3DPOOL_MANAGED,
+                                        &hdTex, nullptr);
     if (FAILED(hr))
     {
-        spdlog::error("HDTextures: failed to lock HD texture for '{}' (hr=0x{:08X})",
-                      texName, (unsigned)hr);
+        // D3D9Ex devices (e.g. LR:FFXIII) don't support MANAGED pool.
+        // Fall back to SYSTEMMEM staging + UpdateTexture into DEFAULT.
+        IDirect3DTexture9* staging = nullptr;
+        hr = pDevice->CreateTexture(w, h, 1, 0, fmt, D3DPOOL_SYSTEMMEM,
+                                    &staging, nullptr);
+        if (FAILED(hr))
+        {
+            spdlog::error("HDTextures: CreateTexture SYSTEMMEM failed (hr=0x{:08X})", (unsigned)hr);
+            return nullptr;
+        }
+        IDirect3DTexture9* def = nullptr;
+        hr = pDevice->CreateTexture(w, h, 1, D3DUSAGE_DYNAMIC, fmt, D3DPOOL_DEFAULT,
+                                    &def, nullptr);
+        if (FAILED(hr))
+        {
+            staging->Release();
+            spdlog::error("HDTextures: CreateTexture DEFAULT failed (hr=0x{:08X})", (unsigned)hr);
+            return nullptr;
+        }
+
+        D3DLOCKED_RECT lk;
+        if (SUCCEEDED(staging->LockRect(0, &lk, nullptr, 0)))
+        {
+            UINT rowPitch = ComputeRowPitch(fmt, w);
+            UINT rowCount = ComputeRowCount(fmt, h);
+            for (UINT row = 0; row < rowCount; row++)
+                memcpy(static_cast<uint8_t*>(lk.pBits) + row * lk.Pitch,
+                       pixels.data() + row * rowPitch, rowPitch);
+            staging->UnlockRect(0);
+        }
+        pDevice->UpdateTexture(staging, def);
+        staging->Release();
+        pixels.clear();
+        pixels.shrink_to_fit();
+        return def;
+    }
+
+    D3DLOCKED_RECT lk;
+    hr = hdTex->LockRect(0, &lk, nullptr, 0);
+    if (FAILED(hr))
+    {
+        spdlog::error("HDTextures: LockRect failed (hr=0x{:08X})", (unsigned)hr);
         hdTex->Release();
         return nullptr;
     }
 
-    UINT hdRowPitch = ComputeRowPitch(hd.format, hd.hdW);
-    UINT hdRowCount = ComputeRowCount(hd.format, hd.hdH);
-    const uint8_t* src = hd.pixelData.data();
-    for (UINT row = 0; row < hdRowCount; row++)
-        memcpy(static_cast<uint8_t*>(hdLocked.pBits) + row * hdLocked.Pitch,
-               src + row * hdRowPitch, hdRowPitch);
+    UINT rowPitch = ComputeRowPitch(fmt, w);
+    UINT rowCount = ComputeRowCount(fmt, h);
+    for (UINT row = 0; row < rowCount; row++)
+        memcpy(static_cast<uint8_t*>(lk.pBits) + row * lk.Pitch,
+               pixels.data() + row * rowPitch, rowPitch);
 
     hdTex->UnlockRect(0);
+    pixels.clear();
+    pixels.shrink_to_fit();
     return hdTex;
 }
 
 
 // -----------------------------------------------------------------------
-// SwapCostumeTexture — hot-swap pixel data for one named gui_resident texture.
-//
-// Releases the existing GPU texture so it will be re-created on the next
-// SetTexture call that references it. Original-pointer caches (textureMap,
-// checkedTextures, pointerKey) are cleared for any entry that pointed at
-// the old GPU object so the rehash and re-upload path is taken cleanly.
-//
-// Must be called under g_hdTexCS.
+// SwapCostumeTexture — queue new pixel data for one named texture.
+// The GPU texture is released immediately; pixel data is stored as a pending
+// swap and uploaded on the next SetTexture bind.
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::SwapCostumeTexture(const std::string& texName,
                                                    UINT hdW, UINT hdH,
                                                    D3DFORMAT format,
                                                    std::vector<uint8_t> pixels)
 {
-    // Release existing GPU texture and evict every pointer that referenced it.
+    // Release existing GPU texture and clear all pointer caches for it.
     auto nit = nameToHDTex.find(texName);
-    if (nit != nameToHDTex.end()) {
+    if (nit != nameToHDTex.end())
+    {
         IDirect3DTexture9* oldTex = nit->second;
 
-        // Remove all fast-path cache entries pointing at this GPU texture.
         std::vector<IDirect3DBaseTexture9*> stale;
         for (auto& [ptr, hdTex] : textureMap)
             if (hdTex == oldTex) stale.push_back(ptr);
-        for (auto ptr : stale) {
+        for (auto ptr : stale)
+        {
             textureMap.erase(ptr);
             checkedTextures.erase(ptr);
             pointerKey.erase(ptr);
         }
+        nameRefs.erase(texName);
 
         if (oldTex) oldTex->Release();
         nameToHDTex.erase(nit);
     }
 
-    // Install new pixel data.
-    HDTextureData& hd = hdData[texName];
-    hd.hdW       = hdW;
-    hd.hdH       = hdH;
-    hd.format    = format;
-    hd.pixelData = std::move(pixels);
+    PendingSwap& ps = pendingSwaps[texName];
+    ps.w      = hdW;
+    ps.h      = hdH;
+    ps.fmt    = format;
+    ps.pixels = std::move(pixels);
 
-    spdlog::info("CostumeTracker: texture '{}' swapped ({}x{}) — will upload on next bind",
+    spdlog::info("CostumeTracker: '{}' queued for swap ({}x{}) — uploads on next bind",
                  texName, hdW, hdH);
 }
 
@@ -1044,38 +622,34 @@ inline bool HDTextureReplacer::ReadDDS(const std::wstring& path, UINT& width, UI
     uint32_t pfFlags     = *reinterpret_cast<uint32_t*>(header + 80);
     uint32_t rgbBitCount = *reinterpret_cast<uint32_t*>(header + 88);
 
-    if (fourCC == 0x31545844)      // "DXT1"
+    if (fourCC == 0x31545844)
         format = D3DFMT_DXT1;
-    else if (fourCC == 0x33545844) // "DXT3"
+    else if (fourCC == 0x33545844)
         format = D3DFMT_DXT3;
-    else if (fourCC == 0x35545844) // "DXT5"
+    else if (fourCC == 0x35545844)
         format = D3DFMT_DXT5;
-    else if (fourCC == 0 && (pfFlags & 0x40)) // DDPF_RGB
+    else if (fourCC == 0 && (pfFlags & 0x40))
     {
-        if (rgbBitCount == 32)
-            format = D3DFMT_A8R8G8B8;
-        else if (rgbBitCount == 16)
-            format = D3DFMT_A4R4G4B4;
+        if      (rgbBitCount == 32) format = D3DFMT_A8R8G8B8;
+        else if (rgbBitCount == 16) format = D3DFMT_A4R4G4B4;
         else
         {
             spdlog::warn("HDTextures: unsupported RGB bit count {} in DDS", rgbBitCount);
             return false;
         }
     }
-    else if (fourCC == 0 && (pfFlags & 0x20000)) // DDPF_LUMINANCE
+    else if (fourCC == 0 && (pfFlags & 0x20000))
     {
-        if (rgbBitCount == 8)
-            format = D3DFMT_L8;
+        if (rgbBitCount == 8) format = D3DFMT_L8;
         else
         {
             spdlog::warn("HDTextures: unsupported luminance bit count {} in DDS", rgbBitCount);
             return false;
         }
     }
-    else if (fourCC == 0 && (pfFlags & 0x2)) // DDPF_ALPHA
+    else if (fourCC == 0 && (pfFlags & 0x2))
     {
-        if (rgbBitCount == 8)
-            format = D3DFMT_A8;
+        if (rgbBitCount == 8) format = D3DFMT_A8;
         else
         {
             spdlog::warn("HDTextures: unsupported alpha bit count {} in DDS", rgbBitCount);

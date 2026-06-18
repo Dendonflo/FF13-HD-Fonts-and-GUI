@@ -461,18 +461,16 @@ static HRESULT WINAPI HookDirect3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
     return S_OK;
 }
 
-#ifdef HDTEX_RELEASE_TRACKING
 // -------------------------------------------------------------------
 // IDirect3DTexture9::Release vtable hook
 //
 // All IDirect3DTexture9 instances from the game's d3d9.dll share one vtable.
 // We patch slot 2 (Release) once, so we learn the instant any texture's
-// refcount reaches zero and can release the matching HD texture immediately —
-// no scene-number heuristics, no LRU cap. Our own HD textures share the same
-// vtable, so the hook re-enters when we release them; that is harmless because
-// HD pointers are not keys in the replacer's pointer map (OnOriginalReleased
-// no-ops on them). g_hdTexCS is a recursive CRITICAL_SECTION, so the re-entry
-// on the same thread does not deadlock.
+// refcount reaches zero and can release the matching HD texture immediately.
+// Our own HD textures share the same vtable, so the hook re-enters when we
+// release them; that is harmless because HD pointers are not keys in the
+// replacer's pointer map (OnOriginalReleased no-ops on them). g_hdTexCS is a
+// recursive CRITICAL_SECTION, so same-thread re-entry does not deadlock.
 // -------------------------------------------------------------------
 using TexReleaseFn = ULONG(STDMETHODCALLTYPE*)(IDirect3DTexture9*);
 static TexReleaseFn g_origTexRelease = nullptr;
@@ -508,7 +506,6 @@ static void InstallTexReleaseHook(IDirect3DTexture9* tex)
     spdlog::info("HDTextures: installed IDirect3DTexture9::Release hook (vtbl={:p})",
                  (void*)vtbl);
 }
-#endif // HDTEX_RELEASE_TRACKING
 
 // -------------------------------------------------------------------
 // IDirect3DDevice9Proxy — three intercepted methods
@@ -530,10 +527,7 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::CreateTexture(
                                         Pool, ppTexture, pSharedHandle);
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (SUCCEEDED(hr) && ppTexture && *ppTexture && g_HDTextures) {
-#ifdef HDTEX_RELEASE_TRACKING
-        // Patch the shared texture vtable on the first texture we ever see.
         InstallTexReleaseHook(*ppTexture);
-#endif
         EnterCriticalSection(&g_hdTexCS);
         g_HDTextures->InvalidateTexture(*ppTexture);
         LeaveCriticalSection(&g_hdTexCS);
