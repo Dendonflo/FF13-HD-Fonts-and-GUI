@@ -892,6 +892,12 @@ inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
         const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
         for (UINT row = 0; row < rowCount; row++)
             h = FNV1a64(bits + row * locked.Pitch, rowPitch, h);
+
+#ifdef HDTEX_DUMP_TEXTURES
+        DumpTextureDDS(h, desc.Format, desc.Width, desc.Height,
+                       locked.pBits, locked.Pitch, rowPitch, rowCount);
+#endif
+
         tex->UnlockRect(0);
 
         res.hash = h;
