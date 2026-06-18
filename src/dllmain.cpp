@@ -83,25 +83,90 @@ static void OnCostumeChanged(const char* charPath,
 static HANDLE       g_hotReloadStop   = nullptr;
 static HANDLE       g_hotReloadThread = nullptr;
 static std::wstring g_shaderDir;
+static std::wstring g_texWatchDir;
 
+// Watch hd_textures\ and hd_textures_shaders\ for file changes using
+// ReadDirectoryChangesW (overlapped). Reloads only when files actually change,
+// with a 500 ms debounce to let a multi-file save finish before triggering.
 static DWORD WINAPI HotReloadThreadProc(LPVOID)
 {
-    constexpr DWORD kIntervalMs = 1000 *
-#ifdef HDTEX_HOT_RELOAD_INTERVAL_SEC
-        HDTEX_HOT_RELOAD_INTERVAL_SEC;
-#else
-        5;
-#endif
-    while (WaitForSingleObject(g_hotReloadStop, kIntervalMs) == WAIT_TIMEOUT)
-    {
-        // Reload textures, hash database, and lazy-load config under the CS.
-        EnterCriticalSection(&g_hdTexCS);
-        if (g_HDTextures) g_HDTextures->HotReload();
-        LeaveCriticalSection(&g_hdTexCS);
+    constexpr DWORD kDebounceMs  = 500;
+    constexpr DWORD kNotifyFlags = FILE_NOTIFY_CHANGE_FILE_NAME
+                                 | FILE_NOTIFY_CHANGE_LAST_WRITE;
 
-        // Reload shader replacements (hash_table.txt + .bin files).
-        // DofPtrMap is NOT cleared — original ptr→hash associations persist.
-        ReloadShaderHashTable(g_shaderDir);
+    const std::wstring* watchPaths[2] = { &g_texWatchDir, &g_shaderDir };
+    HANDLE     hDirs[2]  = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+    OVERLAPPED ov[2]     = {};
+    HANDLE     evs[2]    = {};
+    uint8_t    bufs[2][4096];
+
+    for (int i = 0; i < 2; i++)
+    {
+        evs[i]      = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        ov[i].hEvent = evs[i];
+        if (watchPaths[i]->empty()) continue;
+        hDirs[i] = CreateFileW(watchPaths[i]->c_str(), FILE_LIST_DIRECTORY,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (hDirs[i] != INVALID_HANDLE_VALUE)
+            ReadDirectoryChangesW(hDirs[i], bufs[i], sizeof(bufs[i]),
+                                  TRUE, kNotifyFlags, nullptr, &ov[i], nullptr);
+    }
+
+    HANDLE waitHandles[3] = { g_hotReloadStop, evs[0], evs[1] };
+    bool running = true;
+
+    while (running)
+    {
+        DWORD w = WaitForMultipleObjects(3, waitHandles, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0 || w == WAIT_FAILED) break;
+
+        bool reload[2] = {};
+
+        auto arm = [&](int i) {
+            reload[i] = true;
+            if (hDirs[i] != INVALID_HANDLE_VALUE)
+                ReadDirectoryChangesW(hDirs[i], bufs[i], sizeof(bufs[i]),
+                                      TRUE, kNotifyFlags, nullptr, &ov[i], nullptr);
+        };
+
+        if (w >= WAIT_OBJECT_0 + 1 && w <= WAIT_OBJECT_0 + 2)
+            arm((int)(w - WAIT_OBJECT_0 - 1));
+
+        // Debounce: absorb any further events within kDebounceMs before acting.
+        DWORD until = GetTickCount() + kDebounceMs;
+        for (;;)
+        {
+            DWORD rem = until - GetTickCount();
+            if (rem == 0 || rem > kDebounceMs) break;
+            DWORD w2 = WaitForMultipleObjects(3, waitHandles, FALSE, rem);
+            if (w2 == WAIT_OBJECT_0 || w2 == WAIT_FAILED) { running = false; break; }
+            if (w2 == WAIT_TIMEOUT) break;
+            if (w2 >= WAIT_OBJECT_0 + 1 && w2 <= WAIT_OBJECT_0 + 2)
+                arm((int)(w2 - WAIT_OBJECT_0 - 1));
+        }
+
+        if (!running) break;
+
+        if (reload[0])
+        {
+            spdlog::info("HDTextures: change in hd_textures\\ — reloading textures");
+            EnterCriticalSection(&g_hdTexCS);
+            if (g_HDTextures) g_HDTextures->HotReload();
+            LeaveCriticalSection(&g_hdTexCS);
+        }
+        if (reload[1])
+        {
+            spdlog::info("HDTextures: change in hd_textures_shaders\\ — reloading shaders");
+            ReloadShaderHashTable(g_shaderDir);
+        }
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        if (hDirs[i] != INVALID_HANDLE_VALUE) { CancelIoEx(hDirs[i], &ov[i]); CloseHandle(hDirs[i]); }
+        CloseHandle(evs[i]);
     }
     return 0;
 }
@@ -614,16 +679,11 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID)
 #ifndef HDTEX_DIAG_SKIP_HD_INIT
             g_HDTextures->Init(dllDir);
 #ifdef HDTEX_HOT_RELOAD
+            g_texWatchDir     = g_HDTextures->GetHdRoot();
             g_shaderDir       = dllDir + L"\\hd_textures_shaders";
             g_hotReloadStop   = CreateEvent(nullptr, TRUE, FALSE, nullptr);
             g_hotReloadThread = CreateThread(nullptr, 0, HotReloadThreadProc, nullptr, 0, nullptr);
-            spdlog::info("HDTextures: hot reload enabled (interval {}s) — textures, hashes, shaders",
-#ifdef HDTEX_HOT_RELOAD_INTERVAL_SEC
-                HDTEX_HOT_RELOAD_INTERVAL_SEC
-#else
-                5
-#endif
-            );
+            spdlog::info("HDTextures: hot reload enabled (file-change driven, 500ms debounce)");
 #endif
 #else
             spdlog::info("HDTextures: Init() SKIPPED (diagnostic build)");

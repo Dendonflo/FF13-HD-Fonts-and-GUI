@@ -99,6 +99,7 @@ public:
 
 #ifdef HDTEX_HOT_RELOAD
     void HotReload();
+    const std::wstring& GetHdRoot() const { return m_hdRoot; }
 #endif
 
 private:
