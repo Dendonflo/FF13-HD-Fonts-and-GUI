@@ -33,8 +33,9 @@
 
 class IDirect3DDevice9Proxy : public IDirect3DDevice9Ex {
 public:
-    IDirect3DDevice9Proxy(IDirect3DDevice9Ex* pReal, HDTextureReplacer* pTexReplacer)
-        : m_pReal(pReal), m_pTexReplacer(pTexReplacer), m_refCount(1)
+    IDirect3DDevice9Proxy(IDirect3DDevice9Ex* pReal, HDTextureReplacer* pTexReplacer,
+                          bool isEx = false)
+        : m_pReal(pReal), m_pTexReplacer(pTexReplacer), m_refCount(1), m_isEx(isEx)
     {
         DoFFixerRegistry().push_back(&m_dofFixer);
     }
@@ -55,19 +56,25 @@ public:
             AddRef();
             return S_OK;
         }
-        // For IDirect3DDevice9Ex queries (and any other unrecognized riid),
-        // forward to the real device. The caller (typically d3dx9_43.dll
-        // inside D3DXCreateTexture/etc.) gets the real Ex pointer and uses
-        // it directly. Returning *this for the Ex query causes d3dx9 to
-        // crash deep inside D3DXCreateTexture — likely because d3dx9 takes
-        // shortcuts that assume the device is a stock d3d9.dll-internal
-        // object with a specific vtable layout it can introspect, and our
-        // derived class doesn't match.
+        // IDirect3DDevice9Ex query: behaviour depends on how the device was created.
         //
-        // Trade-off: D3DX-internal calls bypass our HD texture interception.
-        // FF13's GUI textures are loaded via direct device->CreateTexture,
-        // not D3DXCreateTexture, so this path doesn't affect the mod's
-        // primary purpose.
+        // - D3D9Ex device (CreateDeviceEx, e.g. LR:FFXIII): return the proxy itself.
+        //   These games call QI for Ex and then issue CreateTexture/SetTexture through
+        //   that pointer; if we hand back the real device, those calls bypass our proxy
+        //   and HD replacement stops working. Ex titles do not load d3dx9_43.dll, so the
+        //   raw-cast crash below does not apply.
+        //
+        // - Plain D3D9 device (CreateDevice, e.g. FF13-1/FF13-2): forward to the real
+        //   device. d3dx9_43.dll (used by these games) raw-casts the returned pointer
+        //   assuming a stock d3d9.dll vtable layout; returning our proxy crashes deep
+        //   inside D3DXCreateTexture. The trade-off is that D3DX-internal calls bypass
+        //   our interception, which is fine — FF13 loads GUI textures via direct
+        //   device->CreateTexture, not D3DXCreateTexture.
+        if (m_isEx && riid == __uuidof(IDirect3DDevice9Ex)) {
+            *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
+            AddRef();
+            return S_OK;
+        }
         HRESULT hr = m_pReal->QueryInterface(riid, ppvObj);
 #ifdef HDTEX_TRACE_DEVICE
         spdlog::info("DEV::QueryInterface forwarded -> hr=0x{:08X} ppv={:p}", (unsigned)hr, *ppvObj);
@@ -715,7 +722,12 @@ public:
         DEV_TRACE("CreateDepthStencilSurfaceEx"); return m_pReal->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage);
     }
     HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override {
-        if (m_pTexReplacer) m_pTexReplacer->ReleaseTextures();
+        // D3D9Ex does NOT invalidate D3DPOOL_DEFAULT resources on ResetEx — the device
+        // is resilient by design. Do NOT release HD textures here; they stay valid
+        // across ResetEx. Releasing + re-uploading every ResetEx causes severe stutter
+        // (a full GPU stall per texture). Only drop the per-stage binding cache.
+        DEV_TRACE("ResetEx");
+        m_currentTextures.clear();
         return m_pReal->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
     }
     HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override {
@@ -727,6 +739,12 @@ private:
     HDTextureReplacer*  m_pTexReplacer;
     volatile LONG       m_refCount;
     DoFFixer            m_dofFixer;
+    bool                m_isEx;   // device created via CreateDeviceEx (D3D9Ex)
+
+    // Original game texture currently bound to each stage. Recorded in SetTexture
+    // before any swap; the async path uses it to push HD textures to stages the
+    // game bound once and won't rebind.
+    std::unordered_map<DWORD, IDirect3DBaseTexture9*> m_currentTextures;
 #ifdef SHADOW_ALPHA_FIX
     bool                m_inShadowPass   = false;
     DWORD               m_savedAlphaTest = FALSE;

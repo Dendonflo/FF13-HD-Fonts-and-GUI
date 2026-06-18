@@ -277,7 +277,7 @@ DWORD WINAPI VerStub_VerLanguageNameW(DWORD wLang, LPWSTR szLang, DWORD nSize) {
 // -------------------------------------------------------------------
 // Shared device-wrapping logic
 // -------------------------------------------------------------------
-static void WrapDevice(IDirect3DDevice9** ppDevice)
+static void WrapDevice(IDirect3DDevice9** ppDevice, bool isEx = false)
 {
     if (!ppDevice || !*ppDevice) return;
 
@@ -286,9 +286,9 @@ static void WrapDevice(IDirect3DDevice9** ppDevice)
     return;
 #else
     IDirect3DDevice9Ex* pRealEx = static_cast<IDirect3DDevice9Ex*>(*ppDevice);
-    IDirect3DDevice9Proxy* pProxy = new IDirect3DDevice9Proxy(pRealEx, g_HDTextures);
-    spdlog::info("HDTextures: device proxy {:p} wrapping real {:p}",
-                 (void*)pProxy, (void*)*ppDevice);
+    IDirect3DDevice9Proxy* pProxy = new IDirect3DDevice9Proxy(pRealEx, g_HDTextures, isEx);
+    spdlog::info("HDTextures: device proxy {:p} wrapping real {:p} (Ex={})",
+                 (void*)pProxy, (void*)*ppDevice, isEx);
     *ppDevice = pProxy;
 #endif
 }
@@ -302,8 +302,11 @@ static HRESULT STDMETHODCALLTYPE HookCreateDevice(
     DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPP,
     IDirect3DDevice9** ppDevice)
 {
-    spdlog::info("HDTextures: CreateDevice called (Adapter={}, DevType={})",
-                 Adapter, (int)DeviceType);
+    spdlog::info("HDTextures: CreateDevice called (Adapter={}, DevType={}, Flags=0x{:X})",
+                 Adapter, (int)DeviceType, BehaviorFlags);
+    // D3DCREATE_PUREDEVICE disables D3DPOOL_MANAGED — strip it so HD textures
+    // can use the managed pool (and survive plain-D3D9 device resets).
+    BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
     HRESULT hr = TrueCreateDevice(pThis, Adapter, DeviceType, hFocusWindow,
                                   BehaviorFlags, pPP, ppDevice);
     spdlog::info("HDTextures: real CreateDevice hr=0x{:08x}", (unsigned)hr);
@@ -343,13 +346,15 @@ static HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
     D3DDISPLAYMODEEX* pFullscreenDisplayMode,
     IDirect3DDevice9Ex** ppDevice)
 {
-    spdlog::info("HDTextures: CreateDeviceEx called (Adapter={}, DevType={})",
-                 Adapter, (int)DeviceType);
+    spdlog::info("HDTextures: CreateDeviceEx called (Adapter={}, DevType={}, Flags=0x{:X})",
+                 Adapter, (int)DeviceType, BehaviorFlags);
+    // D3DCREATE_PUREDEVICE disables D3DPOOL_MANAGED — strip it so HD textures can use it.
+    BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
     HRESULT hr = TrueCreateDeviceEx(pThis, Adapter, DeviceType, hFocusWindow,
                                     BehaviorFlags, pPP, pFullscreenDisplayMode, ppDevice);
     spdlog::info("HDTextures: real CreateDeviceEx hr=0x{:08x}", (unsigned)hr);
     if (FAILED(hr)) return hr;
-    WrapDevice(reinterpret_cast<IDirect3DDevice9**>(ppDevice));
+    WrapDevice(reinterpret_cast<IDirect3DDevice9**>(ppDevice), /*isEx=*/true);
     return S_OK;
 }
 
@@ -513,6 +518,7 @@ static void InstallTexReleaseHook(IDirect3DTexture9* tex)
 HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::Reset(D3DPRESENT_PARAMETERS* pPP)
 {
     DEV_TRACE("Reset");
+    m_currentTextures.clear();
     EnterCriticalSection(&g_hdTexCS);
     if (g_HDTextures) g_HDTextures->ReleaseTextures();
     LeaveCriticalSection(&g_hdTexCS);
@@ -539,11 +545,16 @@ HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::CreateTexture(
 HRESULT STDMETHODCALLTYPE IDirect3DDevice9Proxy::SetTexture(
     DWORD Stage, IDirect3DBaseTexture9* pTexture)
 {
+    // Record the original bound to this stage before any swap. The async path
+    // uses this to push a completed HD texture to stages the game won't rebind.
+    m_currentTextures[Stage] = pTexture;
+
     IDirect3DBaseTexture9* pFinal = pTexture;
 #ifndef HDTEX_DIAG_NO_HD_TEXTURES
     if (pTexture && g_HDTextures) {
         EnterCriticalSection(&g_hdTexCS);
-        IDirect3DBaseTexture9* pHD = g_HDTextures->OnSetTexture(m_pReal, pTexture);
+        IDirect3DBaseTexture9* pHD =
+            g_HDTextures->OnSetTexture(m_pReal, pTexture, m_currentTextures);
         LeaveCriticalSection(&g_hdTexCS);
         if (pHD) pFinal = pHD;
     }

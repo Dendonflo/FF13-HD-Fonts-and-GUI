@@ -10,12 +10,17 @@
 #include <cstring>
 #include <cctype>
 #include <d3d9.h>
+#ifdef HDTEX_ASYNC_HASH
+#include <deque>
+#include <mutex>
+#include <atomic>
+#endif
 
 #include "spdlog/spdlog.h"
 
 // Runtime HD texture replacement for FF XIII via content hashing.
 //
-// Flow:
+// Flow (synchronous, default):
 //   1. Init(): load hash_database.txt (hash -> name) and scan hd_textures/
 //      subdirs to record DDS paths on disk (lazyPaths). No pixel data loaded.
 //   2. OnSetTexture(): on first bind of an original texture, hash its pixels,
@@ -25,20 +30,37 @@
 //      Drops pointer caches; when the last original referencing an HD texture
 //      is gone (nameRefs -> 0), the GPU texture is released immediately.
 //
+// Flow (HDTEX_ASYNC_HASH — for D3D9Ex titles that stream assets, e.g. LR):
+//   The LockRect + FNV1a hash + DDS disk read are moved to a background worker
+//   thread so the render thread never stalls. OnSetTexture queues a first-seen
+//   texture (AddRef'd) and returns the original immediately; when the worker
+//   finishes, ConsumeHashResults (next SetTexture, render thread) uploads the
+//   HD texture and proactively binds it to any stage still showing the original.
+//
 // Ownership: nameToHDTex is sole owner of all live HD textures.
 //            textureMap is a non-owning fast-path pointer -> HD texture cache.
 //
-// Thread safety: all public methods must be called under g_hdTexCS.
+// Thread safety: all public methods must be called under g_hdTexCS, which is a
+// recursive CRITICAL_SECTION (the Release hook re-enters it). The async worker
+// holds no application lock; it only briefly locks its own hashMtx_.
 class HDTextureReplacer
 {
 public:
+#ifdef HDTEX_ASYNC_HASH
+    ~HDTextureReplacer() { StopHashThread(); }
+#endif
+
     // modDir: directory containing version.dll.
     // Reads hd_textures\hash_database.txt and scans hd_textures\ subdirs.
     void Init(const std::wstring& modDir);
 
     // Called from SetTexture hook — identifies texture by hash, swaps if HD available.
+    // currentTextures (stage -> bound original pointer) is only used by the async
+    // path, to push completed HD textures to stages the game won't rebind.
     IDirect3DBaseTexture9* OnSetTexture(IDirect3DDevice9* pDevice,
-                                        IDirect3DBaseTexture9* pTexture);
+                                        IDirect3DBaseTexture9* pTexture,
+                                        const std::unordered_map<DWORD,
+                                            IDirect3DBaseTexture9*>& currentTextures);
 
     // Called on device Reset — releases all GPU-side HD textures.
     void ReleaseTextures();
@@ -96,6 +118,54 @@ private:
     std::unordered_map<std::string, PendingSwap> pendingSwaps;
 
     std::wstring m_hdRoot;
+
+#ifdef HDTEX_ASYNC_HASH
+    // -----------------------------------------------------------------------
+    // Async hash worker
+    //
+    // The worker pops a job (an AddRef'd original texture), locks + hashes it,
+    // looks the hash up in hashDB, and — on a match — reads the HD DDS from disk
+    // into the result. All of that (the stall-prone work) runs off the render
+    // thread. ConsumeHashResults, on the render thread, does only the GPU upload.
+    //
+    // The AddRef on the original keeps it alive for the worker's LockRect and
+    // also prevents its address from being recycled while in flight, so pendingHash_
+    // alone (no jobId) is enough to identify a live job. If a result arrives whose
+    // pTex is no longer in pendingHash_ (device reset drained the pipeline), it is
+    // discarded and its ref released.
+    //
+    // Lock order: g_hdTexCS (render thread) -> hashMtx_. The worker takes only
+    // hashMtx_, never g_hdTexCS, so the order is never reversed.
+    // -----------------------------------------------------------------------
+    struct HashJob { IDirect3DBaseTexture9* pTex; };   // pTex AddRef'd by QueueHashJob
+    struct HashResult {
+        IDirect3DBaseTexture9* pTex;     // still AddRef'd; ConsumeHashResults releases
+        bool                   match;
+        std::string            texName;  // valid iff match
+        UINT                   hdW, hdH; // HD dimensions (from DDS), iff match
+        D3DFORMAT              hdFmt;
+        std::vector<uint8_t>   pixels;   // HD pixel data read from disk, iff match
+        uint64_t               hash;     // for logging
+        UINT                   srcW, srcH;
+    };
+
+    std::mutex                                       hashMtx_;
+    std::deque<HashJob>                              hashJobs_;
+    std::deque<HashResult>                           hashResults_;
+    // Originals currently in the hash pipeline (AddRef'd). Touched only under g_hdTexCS.
+    std::unordered_set<IDirect3DBaseTexture9*>       pendingHash_;
+    HANDLE                                           hashThread_     = nullptr;
+    HANDLE                                           hashSemaphore_  = nullptr;
+    std::atomic<bool>                                hashStop_       { false };
+
+    void StartHashThread();
+    void StopHashThread();
+    void QueueHashJob(IDirect3DBaseTexture9* pTex);   // under g_hdTexCS
+    void ConsumeHashResults(IDirect3DDevice9* pDevice,
+                            const std::unordered_map<DWORD,
+                                IDirect3DBaseTexture9*>& currentTextures); // under g_hdTexCS
+    static DWORD WINAPI HashThreadProc(LPVOID pThis);
+#endif // HDTEX_ASYNC_HASH
 
     // Read DDS from disk and upload to GPU. Returns new texture (caller registers
     // in nameToHDTex) or nullptr on failure. Pixel buffer is freed after upload.
@@ -235,6 +305,10 @@ inline void HDTextureReplacer::Init(const std::wstring& modDir)
 
     spdlog::info("HDTextures: {} hash(es), {} HD path(s) indexed",
                  hashDB.size(), lazyPaths.size());
+
+#ifdef HDTEX_ASYNC_HASH
+    StartHashThread();
+#endif
 }
 
 
@@ -293,6 +367,18 @@ inline void HDTextureReplacer::RescanDisk()
 #ifdef HDTEX_HOT_RELOAD
 inline void HDTextureReplacer::HotReload()
 {
+#ifdef HDTEX_ASYNC_HASH
+    // Drain any in-flight hash work before tearing down the maps.
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        for (auto& j : hashJobs_)    if (j.pTex) j.pTex->Release();
+        for (auto& r : hashResults_) if (r.pTex) r.pTex->Release();
+        hashJobs_.clear();
+        hashResults_.clear();
+    }
+    pendingHash_.clear();
+#endif
+
     for (auto& [name, tex] : nameToHDTex)
         if (tex) tex->Release();
     nameToHDTex.clear();
@@ -318,10 +404,31 @@ inline void HDTextureReplacer::HotReload()
 // -----------------------------------------------------------------------
 // OnSetTexture — identify texture by hash, swap if HD replacement available
 // -----------------------------------------------------------------------
-inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* pDevice,
-                                                              IDirect3DBaseTexture9* pTexture)
+inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(
+    IDirect3DDevice9* pDevice, IDirect3DBaseTexture9* pTexture,
+    const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures)
 {
     if (!pTexture || hashDB.empty()) return pTexture;
+
+#ifdef HDTEX_ASYNC_HASH
+    // Drain any completed background hashes first (uploads + stage pushes).
+    ConsumeHashResults(pDevice, currentTextures);
+
+    // Fast path: already mapped.
+    auto mapIt = textureMap.find(pTexture);
+    if (mapIt != textureMap.end())
+        return mapIt->second;
+
+    // Already checked with no match, or already queued for hashing.
+    if (checkedTextures.count(pTexture) || pendingHash_.count(pTexture))
+        return pTexture;
+
+    // First time we see this pointer: queue it for the worker and return the
+    // original for now. The HD swap is applied later by ConsumeHashResults.
+    QueueHashJob(pTexture);
+    return pTexture;
+#else
+    (void)currentTextures;
 
     // Fast path: already mapped.
     auto mapIt = textureMap.find(pTexture);
@@ -395,6 +502,7 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
                   texName, h);
 
     return hdTex;
+#endif // HDTEX_ASYNC_HASH
 }
 
 
@@ -403,6 +511,22 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
 // -----------------------------------------------------------------------
 inline void HDTextureReplacer::ReleaseTextures()
 {
+#ifdef HDTEX_ASYNC_HASH
+    // Drain the hash pipeline. Releasing each AddRef'd original may trip the
+    // Release hook (recursive CS) and clean its own name; the loops below then
+    // skip what's already gone. A job the worker has already popped but not yet
+    // pushed will produce a result later whose pTex is absent from pendingHash_,
+    // and ConsumeHashResults discards + releases it.
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        for (auto& j : hashJobs_)    if (j.pTex) j.pTex->Release();
+        for (auto& r : hashResults_) if (r.pTex) r.pTex->Release();
+        hashJobs_.clear();
+        hashResults_.clear();
+    }
+    pendingHash_.clear();
+#endif
+
     for (auto& [name, tex] : nameToHDTex)
         if (tex) tex->Release();
     nameToHDTex.clear();
@@ -456,6 +580,215 @@ inline void HDTextureReplacer::OnOriginalReleased(IDirect3DBaseTexture9* pTextur
 
     spdlog::debug("HDTextures: released HD '{}' (last original freed)", name);
 }
+
+
+#ifdef HDTEX_ASYNC_HASH
+// -----------------------------------------------------------------------
+// Async hash worker — lifecycle
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::StartHashThread()
+{
+    if (hashThread_) return;
+    hashStop_.store(false);
+    hashSemaphore_ = CreateSemaphoreW(nullptr, 0, LONG_MAX, nullptr);
+    if (!hashSemaphore_) {
+        spdlog::error("HDTextures: hash semaphore creation failed");
+        return;
+    }
+    hashThread_ = CreateThread(nullptr, 0, HashThreadProc, this, 0, nullptr);
+    if (!hashThread_) {
+        spdlog::error("HDTextures: hash thread creation failed");
+        CloseHandle(hashSemaphore_);
+        hashSemaphore_ = nullptr;
+    } else {
+        spdlog::info("HDTextures: async hash thread started");
+    }
+}
+
+inline void HDTextureReplacer::StopHashThread()
+{
+    if (!hashThread_) return;
+    hashStop_.store(true);
+    if (hashSemaphore_) ReleaseSemaphore(hashSemaphore_, 1, nullptr);
+    WaitForSingleObject(hashThread_, 3000);
+    CloseHandle(hashThread_); hashThread_ = nullptr;
+    if (hashSemaphore_) { CloseHandle(hashSemaphore_); hashSemaphore_ = nullptr; }
+}
+
+// -----------------------------------------------------------------------
+// QueueHashJob — AddRef the original and hand it to the worker.
+// Must be called under g_hdTexCS. The AddRef keeps the texture alive (and its
+// address un-recyclable) for the duration of the hash.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::QueueHashJob(IDirect3DBaseTexture9* pTex)
+{
+    if (!hashSemaphore_) return;
+    if (!pendingHash_.insert(pTex).second) return;   // already queued
+
+    pTex->AddRef();
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        hashJobs_.push_back({ pTex });
+    }
+    ReleaseSemaphore(hashSemaphore_, 1, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// HashThreadProc — background worker: LockRect + FNV1a + hashDB lookup, and on
+// a match, read the HD DDS from disk. Holds no application lock; only locks
+// hashMtx_ briefly to pop a job and push a result.
+// -----------------------------------------------------------------------
+inline DWORD WINAPI HDTextureReplacer::HashThreadProc(LPVOID pThis)
+{
+    HDTextureReplacer* self = static_cast<HDTextureReplacer*>(pThis);
+    while (true)
+    {
+        WaitForSingleObject(self->hashSemaphore_, INFINITE);
+        if (self->hashStop_.load()) break;
+
+        HashJob job;
+        {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            if (self->hashJobs_.empty()) continue;
+            job = self->hashJobs_.front();
+            self->hashJobs_.pop_front();
+        }
+
+        HashResult res;
+        res.pTex  = job.pTex;
+        res.match = false;
+        res.hash  = 0;
+        res.hdW = res.hdH = res.srcW = res.srcH = 0;
+        res.hdFmt = D3DFMT_UNKNOWN;
+
+        auto pushResult = [&]() {
+            std::lock_guard<std::mutex> lk(self->hashMtx_);
+            self->hashResults_.push_back(std::move(res));
+        };
+
+        if (job.pTex->GetType() != D3DRTYPE_TEXTURE) { pushResult(); continue; }
+        IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(job.pTex);
+
+        D3DSURFACE_DESC desc;
+        if (FAILED(tex->GetLevelDesc(0, &desc))) { pushResult(); continue; }
+
+        UINT rowPitch = ComputeRowPitch(desc.Format, desc.Width);
+        UINT rowCount = ComputeRowCount(desc.Format, desc.Height);
+        res.srcW = desc.Width; res.srcH = desc.Height;
+        if (!rowPitch || !rowCount) { pushResult(); continue; }
+
+        D3DLOCKED_RECT locked;
+        if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
+        {
+            // Non-lockable (DEFAULT pool, not DYNAMIC) — treat as permanent miss.
+            pushResult();
+            continue;
+        }
+
+        uint64_t h = 14695981039346656037ULL;
+        const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
+        for (UINT row = 0; row < rowCount; row++)
+            h = FNV1a64(bits + row * locked.Pitch, rowPitch, h);
+        tex->UnlockRect(0);
+        res.hash = h;
+
+        // hashDB is built in Init() and never mutated during normal operation.
+        auto dbIt = self->hashDB.find(h);
+        if (dbIt != self->hashDB.end())
+        {
+            // Read the HD DDS here, off the render thread.
+            auto pathIt = self->lazyPaths.find(dbIt->second);
+            if (pathIt != self->lazyPaths.end())
+            {
+                UINT w, hgt; D3DFORMAT fmt; std::vector<uint8_t> px;
+                if (ReadDDS(pathIt->second, w, hgt, fmt, px))
+                {
+                    res.match  = true;
+                    res.texName = dbIt->second;
+                    res.hdW = w; res.hdH = hgt; res.hdFmt = fmt;
+                    res.pixels = std::move(px);
+                }
+            }
+        }
+        pushResult();
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------
+// ConsumeHashResults — render thread: apply completed hashes.
+//   miss  -> checkedTextures
+//   match -> reuse or GPU-upload the HD texture, register caches, and push it
+//            to any stage still bound to the original (game won't rebind).
+// Must be called under g_hdTexCS.
+// -----------------------------------------------------------------------
+inline void HDTextureReplacer::ConsumeHashResults(
+    IDirect3DDevice9* pDevice,
+    const std::unordered_map<DWORD, IDirect3DBaseTexture9*>& currentTextures)
+{
+    std::deque<HashResult> batch;
+    {
+        std::lock_guard<std::mutex> lk(hashMtx_);
+        batch.swap(hashResults_);
+    }
+    if (batch.empty()) return;
+
+    auto pushToStages = [&](IDirect3DBaseTexture9* pOrig, IDirect3DTexture9* pHD) {
+        for (auto& [stage, pBound] : currentTextures)
+            if (pBound == pOrig)
+                pDevice->SetTexture(stage, pHD);
+    };
+
+    for (auto& r : batch)
+    {
+        // Stale (pipeline drained by a device reset since this job was queued).
+        if (!pendingHash_.erase(r.pTex)) { r.pTex->Release(); continue; }
+
+        if (!r.match)
+        {
+            checkedTextures.insert(r.pTex);
+            r.pTex->Release();
+            continue;
+        }
+
+        // Already resident (same logical texture reloaded at a new address).
+        auto nameIt = nameToHDTex.find(r.texName);
+        if (nameIt != nameToHDTex.end())
+        {
+            textureMap[r.pTex] = nameIt->second;
+            pointerKey[r.pTex] = r.texName;
+            nameRefs[r.texName]++;
+            pushToStages(r.pTex, nameIt->second);
+            r.pTex->Release();
+            continue;
+        }
+
+        IDirect3DTexture9* hdTex =
+            CreateHDTextureFromData(pDevice, r.hdW, r.hdH, r.hdFmt, r.pixels);
+        if (!hdTex)
+        {
+            checkedTextures.insert(r.pTex);
+            r.pTex->Release();
+            continue;
+        }
+
+        nameToHDTex[r.texName] = hdTex;
+        textureMap[r.pTex]     = hdTex;
+        pointerKey[r.pTex]     = r.texName;
+        nameRefs[r.texName]    = 1;
+        pushToStages(r.pTex, hdTex);
+
+        spdlog::debug("HDTextures: async MATCH '{}' {:016x} {}x{} -> {}x{}",
+                      r.texName, r.hash, r.srcW, r.srcH, r.hdW, r.hdH);
+
+        // Release our pipeline AddRef. If the game already let go of r.pTex
+        // while it was in flight, this drops it to zero and the Release hook
+        // tears down what we just built — wasteful but correct, and the texture
+        // was about to disappear anyway.
+        r.pTex->Release();
+    }
+}
+#endif // HDTEX_ASYNC_HASH
 
 
 // -----------------------------------------------------------------------

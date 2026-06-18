@@ -34,29 +34,77 @@ requests. Confirm preload threads shut down cleanly on exit.
 
 ---
 
-## `release-on-og-free` — Simplified release-driven lifetime (off `main`)
+## `release-on-og-free` — All-in-one release-driven model (off `main`)
 
-Architectural redesign that removes the LRU/group/namespace machinery entirely.
-Instead of heuristics, HD texture lifetime mirrors the game's own: load on
-first bind (always from disk — no preloading), release when the game's own
-`Release` refcount hits zero. Uses a single vtable patch on
-`IDirect3DTexture9::Release` to observe frees.
+The intended replacement for `main` and `async-hash-perf` both. A single
+codebase that builds one DLL for all three games, with the slow-path strategy
+chosen at build time and the D3D9-vs-D3D9Ex differences detected at runtime.
 
-Key removals: `NumberedGroup`, `FlushGroup`, `EvictOldest`, `lazyload_config.txt`,
-`lazyPrefixes`, `lazyLruCaps`, `hdData` as a persistent map. Net: ~430 lines vs
-~1000 on `main`.
+### Core model — release-driven lifetime
 
-**Status:** Compile-verified, not yet tested in-game. Likely to replace `main`
-once confirmed working.
+Removes the LRU/group/namespace machinery entirely. HD texture lifetime mirrors
+the game's own: load on first bind (always from disk — no preloading), release
+when the game's own `Release` refcount hits zero, observed via a single vtable
+patch on `IDirect3DTexture9::Release`. A per-name refcount (`nameRefs`) lets the
+same logical texture reloaded at multiple addresses share one HD texture.
 
-**Before merging to main:** 
-- Run through a full FF13-2 session: menus, combat, multiple map transitions,
-  costume changes. Check `HDTextures.log` for unexpected releases or double-frees.
-- Confirm VRAM stays bounded across long sessions (no leak if `nameRefs` ever
-  gets out of sync).
-- Test device Reset path (alt-tab, resolution change) — all HD textures should
-  be recreated cleanly on next bind.
-- Verify the vtable patch doesn't interfere with FF13Fix or any other d3d9 mod.
-- If `async-hash-perf` is ever merged, the Release hook and the async hash
-  thread need careful coordination — a texture could be freed while its hash
-  is still in the worker queue.
+Removed vs `main`: `NumberedGroup`, `FlushGroup`, `EvictOldest`,
+`lazyload_config.txt`, `lazyPrefixes`, `lazyLruCaps`, persistent `hdData`.
+
+### Runtime D3D9 / D3D9Ex detection (automatic, no flag)
+
+The proxy records whether the device came from `CreateDeviceEx` and adapts:
+- **Ex-QI:** Ex devices (LR) get the proxy back for `IID_IDirect3DDevice9Ex`
+  queries so their texture calls stay intercepted; plain devices (FF13-1/2)
+  forward to the real device to avoid the d3dx9 raw-cast crash.
+- **ResetEx:** Ex devices keep their HD textures (D3D9Ex is resilient — no DEFAULT
+  pool loss); plain `Reset` releases and lazily recreates them.
+- **Upload:** `CreateHDTextureFromData` uses `D3DPOOL_MANAGED`, falling back to a
+  SYSTEMMEM staging + `UpdateTexture` into DEFAULT when MANAGED is rejected (Ex).
+- `D3DCREATE_PUREDEVICE` is stripped at device creation so MANAGED is available.
+
+### Async hashing (build-time flag: `HDTEX_ASYNC_HASH`)
+
+For D3D9Ex titles that stream assets continuously (LR), the synchronous
+`LockRect` + hash on the render thread causes multi-second stalls (D3D9Ex has no
+MANAGED pool, so locking the game's originals can force a GPU→CPU readback). With
+the flag defined, a background worker does the lock, hash, DB lookup, **and** the
+HD DDS disk read; the render thread only does the GPU upload (`ConsumeHashResults`)
+and proactively binds the HD to any stage still showing the original. Originals
+are AddRef'd while in flight (keeps them alive for the worker and composes with
+the Release hook). Without the flag, hashing is fully synchronous as above.
+
+### Build matrix (one codebase)
+
+| Game | `HDTEX_ASYNC_HASH` | `HDTEX_ASSET_SUBDIR` | `COSTUME_TRACKING` |
+|------|:---:|:---:|:---:|
+| FF13-1 | off | — | off |
+| FF13-2 | off | — | on |
+| LR:FFXIII | **on** | `weiss_data` | off (LR map TBD) |
+
+**Status:** Compile-verified in both sync and async configurations. Not yet
+tested in-game in either.
+
+**Before merging to main:**
+- **Sync (FF13-1/2):** full session — menus, combat, map transitions, costume
+  changes. Watch `HDTextures.log` for unexpected releases or double-frees.
+  Confirm the Release vtable patch doesn't conflict with FF13Fix.
+- **Async (LR):** confirm streaming no longer stutters and textures pop in within
+  a few frames. Stress map transitions (heavy queue churn). Verify no leak if a
+  texture is released mid-hash (the in-flight AddRef + `pendingHash_` guard).
+- **Both:** device reset paths (alt-tab, resolution change). Confirm VRAM stays
+  bounded across long sessions.
+- Worker shutdown is clean on exit (`StopHashThread` in the destructor).
+
+---
+
+## Retiring the other branches
+
+Once `release-on-og-free` is verified in-game, it supersedes both:
+- `main` — replaced by the release-driven model (sync build).
+- `async-hash-perf` — its async goal is folded in here behind `HDTEX_ASYNC_HASH`,
+  without the LRU/preload-thread machinery. Note this branch took a different
+  locking route: it used an SRWLock, which is **incompatible** with the Release
+  vtable hook (the hook re-enters the lock when freeing HD textures; SRWLock is
+  not recursive and would deadlock). `release-on-og-free` keeps the recursive
+  `CRITICAL_SECTION` for that reason.
